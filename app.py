@@ -1447,13 +1447,32 @@ def m3u_proxy():
     app.logger.info(f"Cozuluyor: {url}")
 
     real_url = resolve_stream_url(url)
-    if real_url:
-        app.logger.info(f"Gercek link: {real_url}")
-        return redirect(real_url, code=302)
-    else:
-        # Token veya resolve basarisiz — debug icin ham yaniti goster
+    if not real_url:
         sig = get_vavoo_signature()
         return jsonify({"error": "stream_url_not_found", "token_ok": sig is not None, "url": url}), 502
+
+    app.logger.info(f"Gercek link: {real_url}")
+
+    # Once redirect dene, olmadiysa stream'i proxyle
+    mode = request.args.get('mode', 'redirect')
+    if mode == 'proxy':
+        try:
+            headers = {k: v for k, v in request.headers if k.lower() not in
+                      ['host', 'content-length', 'transfer-encoding']}
+            stream_resp = requests.get(real_url, headers=headers, stream=True, timeout=20)
+            return Response(
+                stream_resp.iter_content(chunk_size=8192),
+                status=stream_resp.status_code,
+                content_type=stream_resp.headers.get('Content-Type', 'application/vnd.apple.mpegurl'),
+                headers={
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-cache',
+                }
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+
+    return redirect(real_url, code=302)
 
 @app.route('/resolve')
 def resolve():
@@ -1479,7 +1498,7 @@ def turkey_playlist():
     
     for ch in TURKEY_CHANNELS:
         m3u_lines.append(f'#EXTINF:-1 group-title="Turkey",{ch["name"]}\n')
-        proxy_url = f"{base}/m3u?url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
+        proxy_url = f"{base}/m3u?mode=proxy&url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
         m3u_lines.append(proxy_url + "\n")
     
     return Response(''.join(m3u_lines), mimetype='audio/x-mpegurl')
