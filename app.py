@@ -1240,7 +1240,8 @@ TURKEY_CHANNELS = [
 
 @app.route('/')
 def index():
-    host = request.host
+    scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{scheme}://{request.host}"
     return f"""
     <!DOCTYPE html>
     <html>
@@ -1269,7 +1270,7 @@ def index():
         </div>
         
         <h3>📺 M3U Playlist Linki:</h3>
-        <pre id="m3uLink">https://{host}/turkey.m3u</pre>
+        <pre id="m3uLink">{base}/turkey.m3u</pre>
         
         <h3>🔍 Tek Link Test:</h3>
         <input type="text" id="vavooUrl" placeholder="https://vavoo.to/vavoo-iptv/play/...">
@@ -1277,7 +1278,7 @@ def index():
         <pre id="result"></pre>
         
         <h3>📋 Televizo'ya Ekle:</h3>
-        <p><code class="link">https://{host}/turkey.m3u</code></p>
+        <p><code class="link">{base}/turkey.m3u</code></p>
         
         <h3>🔎 Kanal Ara:</h3>
         <input type="text" id="search" placeholder="Kanal adı..." onkeyup="searchChannels()">
@@ -1430,14 +1431,41 @@ def turkey_playlist():
     m3u_lines.append(f"# TÜRKİYE KANALLARI - {len(TURKEY_CHANNELS)} KANAL\n")
     m3u_lines.append(f"# Oluşturulma: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
     
-    host = request.host
+    # Render'da https, local'de http — otomatik algıla
+    scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{scheme}://{request.host}"
     
     for ch in TURKEY_CHANNELS:
         m3u_lines.append(f'#EXTINF:-1 group-title="Turkey",{ch["name"]}\n')
-        proxy_url = f"https://{host}/m3u?url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
+        proxy_url = f"{base}/m3u?url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
         m3u_lines.append(proxy_url + "\n")
     
     return Response(''.join(m3u_lines), mimetype='audio/x-mpegurl')
+
+
+@app.route('/vavoo_full.m3u')
+def vavoo_full():
+    """vavoo_Turkey.m3u harici dosyasını okuyup proxy'ye yönlendir"""
+    try:
+        with open('vavoo_Turkey.m3u', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return "vavoo_Turkey.m3u dosyası bulunamadı", 404
+
+    scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{scheme}://{request.host}"
+
+    new_lines = ["#EXTM3U\n"]
+    for line in lines:
+        line = line.strip()
+        if line.startswith('#EXTINF'):
+            new_lines.append(line + '\n')
+        elif line.startswith('http') and 'vavoo.to' in line:
+            new_lines.append(f"{base}/m3u?url={line}\n")
+        elif line:
+            new_lines.append(line + '\n')
+
+    return Response(''.join(new_lines), mimetype='audio/x-mpegurl')
 
 @app.route('/stats')
 def stats():
@@ -1457,4 +1485,5 @@ if __name__ == '__main__':
     print(f"🇹🇷 Vavoo Turkey Proxy Başlatılıyor...")
     print(f"📺 Toplam Kanal: {len(TURKEY_CHANNELS)}")
     print(f"🚀 Port: {port}")
-    app.run(host='0.0.0.0', port=port)
+    print(f"📡 http://localhost:{port}/turkey.m3u")
+    app.run(host='0.0.0.0', port=port, debug=False)
