@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: vavoo-proxy
+    name: umithalleder
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
