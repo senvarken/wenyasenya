@@ -4,171 +4,1527 @@ import requests
 import json
 import logging
 import os
+import re
 import time
-import random
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
-VAVOO_API = "https://vavoo.to/mediahubmx-resolve.json"
+VAVOO_DOMAIN = "vavoo.to"
+VAVOO_PING_URL = "https://www.vavoo.tv/api/app/ping"
 
 # Token cache
-_sig_cache = {"token": None, "time": 0}
+_token_cache = {"token": None, "time": 0}
+TOKEN_TTL = 3600  # 1 saat
 
-def get_signature():
-    """Lokke signature al - 1 saat cache"""
+# Stream URL cache
+cache = {}
+CACHE_TIME = 300  # 5 dakika
+
+
+def get_lokke_signature():
+    """Lokke API ile signature al - titkenan/vavoo-iptv yontemi"""
     now = time.time()
-    if _sig_cache["token"] and (now - _sig_cache["time"]) < 3600:
-        return _sig_cache["token"]
+    if _token_cache["token"] and (now - _token_cache["time"]) < TOKEN_TTL:
+        return _token_cache["token"]
+
+    headers = {
+        "user-agent": "okhttp/4.11.0",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+    }
+    data = {
+        "token": "",
+        "reason": "boot",
+        "locale": "de",
+        "theme": "dark",
+        "metadata": {
+            "device": {"type": "desktop", "uniqueId": ""},
+            "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP-USER"},
+            "app": {"platform": "electron"},
+            "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}
+        },
+        "appFocusTime": 173,
+        "playerActive": False,
+        "playDuration": 0,
+        "devMode": True,
+        "hasAddon": True,
+        "castConnected": False,
+        "package": "app.lokke.main",
+        "version": "1.0.19",
+        "process": "app",
+        "firstAppStart": int(time.time() * 1000) - 10000,
+        "lastAppStart": int(time.time() * 1000) - 10000,
+        "ipLocation": 0,
+        "adblockEnabled": True,
+        "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
+        "iap": {"supported": False}
+    }
+
     try:
-        data = {
-            "token": "", "reason": "boot", "locale": "de", "theme": "dark",
-            "metadata": {
-                "device": {"type": "desktop", "uniqueId": ""},
-                "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP"},
-                "app": {"platform": "electron"},
-                "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}
-            },
-            "appFocusTime": 173, "playerActive": False, "playDuration": 0,
-            "devMode": True, "hasAddon": True, "castConnected": False,
-            "package": "app.lokke.main", "version": "1.0.19", "process": "app",
-            "firstAppStart": int(now*1000)-10000, "lastAppStart": int(now*1000)-10000,
-            "ipLocation": 0, "adblockEnabled": True,
-            "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
-            "iap": {"supported": False}
-        }
         resp = requests.post(
             "https://www.lokke.app/api/app/ping",
             json=data,
-            headers={"user-agent": "okhttp/4.11.0", "content-type": "application/json"},
+            headers=headers,
             timeout=10
         )
+        resp.raise_for_status()
         token = resp.json().get("addonSig")
         if token:
-            _sig_cache["token"] = token
-            _sig_cache["time"] = now
-            app.logger.info(f"Token alindi: {token[:20]}...")
+            _token_cache["token"] = token
+            _token_cache["time"] = now
+            app.logger.info(f"Lokke token alindi: {token[:20]}...")
             return token
     except Exception as e:
-        app.logger.error(f"Token hatasi: {e}")
+        app.logger.error(f"Lokke token alinamadi: {e}")
     return None
 
-def resolve_url(vavoo_url):
-    """URL'yi resolve et - once token ile, olmazsa token'siz"""
-    
-    def do_resolve(sig=None):
-        headers = {
-            "User-Agent": "MediaHubMX/2",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        if sig:
-            headers["mediahubmx-signature"] = sig
-        
-        payload = {
-            "language": "tr",
-            "region": "TR",
-            "url": vavoo_url,
-            "clientVersion": "3.0.3"
-        }
-        resp = requests.post(VAVOO_API, json=payload, headers=headers, timeout=15)
-        app.logger.info(f"API status: {resp.status_code}")
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0 and "url" in data[0]:
-                return data[0]["url"]
-            elif isinstance(data, dict):
-                return data.get("url") or data.get("streamUrl")
+# Alias
+get_vavoo_signature = get_lokke_signature
+
+
+def resolve_stream_url(vavoo_play_url):
+    if vavoo_play_url in cache:
+        cache_time, cached_url = cache[vavoo_play_url]
+        if time.time() - cache_time < CACHE_TIME:
+            return cached_url
+
+    signature = get_vavoo_signature()
+    if not signature:
         return None
 
-    # 1. Lokke token ile dene
-    sig = get_signature()
-    real_url = do_resolve(sig)
-    if real_url:
-        return real_url
+    headers = {
+        "user-agent": "MediaHubMX/2",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "mediahubmx-signature": signature
+    }
+    payload = {
+        "language": "de",
+        "region": "AT",
+        "url": vavoo_play_url,
+        "clientVersion": "3.0.2"
+    }
 
-    # 2. Token'siz dene (yerelde calisiyordu)
-    app.logger.info("Token ile olmadi, token'siz deneniyor...")
-    real_url = do_resolve(None)
-    return real_url
+    try:
+        resp = requests.post(
+            f"https://{VAVOO_DOMAIN}/mediahubmx-resolve.json",
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        data = resp.json()
+        real_url = None
+        if isinstance(data, list) and len(data) > 0:
+            real_url = data[0].get("url")
+        elif isinstance(data, dict):
+            real_url = data.get("url") or data.get("streamUrl")
+        if real_url:
+            cache[vavoo_play_url] = (time.time(), real_url)
+            return real_url
+    except Exception as e:
+        app.logger.error(f"Resolve hatasi: {e}")
+    return None
+
+# ===========================================
+# TÜM TÜRKİYE KANALLARI - 1000+ KANAL
+# ===========================================
+TURKEY_CHANNELS = [
+    {"name": "24 .s", "id": "17029379329ed4b84db05f"},
+    {"name": "24 HABER HD+ SD .b", "id": "3828793616b62b9cc5834c"},
+    {"name": "24 KITCHEN .c", "id": "329569928726734a4497dc"},
+    {"name": "24 KITCHEN .s", "id": "332950484357e3f01f03c1"},
+    {"name": "24 KITCHEN HD .b", "id": "42853502477bb17264f322"},
+    {"name": "24 RAW .b", "id": "536029186d3e964e7e9db"},
+    {"name": "24 TV .c", "id": "38229012391e140a7f75ba"},
+    {"name": "360 .c", "id": "865410951ffe12c74b00b"},
+    {"name": "360 .s", "id": "1651455199e724b10b3554"},
+    {"name": "360 PLUS .s", "id": "1893598000587432322459"},
+    {"name": "360 RAW .b", "id": "17026451919e48523c30db"},
+    {"name": "4K TR: 24 HD .b", "id": "19981681222fca08eb4e83"},
+    {"name": "4K TR: 360 HD .b", "id": "473300573b9945e4c1fe4"},
+    {"name": "4K TR: A HABER HD .b", "id": "1064954896a21f89fb6b5c"},
+    {"name": "4K TR: A SPOR HD .b", "id": "1771137539fa2adff8ebd5"},
+    {"name": "4K TR: A2 HD .b", "id": "201905527745e40d41f657"},
+    {"name": "4K TR: AK T TV HD .b", "id": "344558568784e9a5583953"},
+    {"name": "4K TR: ATV HD .b", "id": "2325261286cc81b01cf95d"},
+    {"name": "4K TR: BABYTV .b", "id": "175831345619066ec797e8"},
+    {"name": "4K TR: BENG T RK .b", "id": "2702376790ed1b5502281a"},
+    {"name": "4K TR: BEYAZ TV HD .b", "id": "805689873341639546753"},
+    {"name": "4K TR: BLOOMBERG HT HD .b", "id": "315207916849418564f7e9"},
+    {"name": "4K TR: BOOMERANG .b", "id": "3510107618b4bd2dc6657d"},
+    {"name": "4K TR: CARTOON NETWORK .b", "id": "327818589842dbaee1327c"},
+    {"name": "4K TR: CNN T RK HD .b", "id": "2056768647bd7eb3f3cf70"},
+    {"name": "4K TR: DA VINCI .b", "id": "41034540643b582da308f"},
+    {"name": "4K TR: DISNEY JUNIOR .b", "id": "6492287228e9a72f932b5"},
+    {"name": "4K TR: DMAX HD .b", "id": "869937351ec185ded43b6"},
+    {"name": "4K TR: DREAM T RK .b", "id": "42666830256873dd1e7fac"},
+    {"name": "4K TR: DUCK TV HD .b", "id": "1709129189f694bdd416ac"},
+    {"name": "4K TR: EKOL TV .b", "id": "2706210049a80b69a6323c"},
+    {"name": "4K TR: EPIC DRAMA .b", "id": "6782616930c5115ad7507"},
+    {"name": "4K TR: EUROSPORT 1 HD .b", "id": "207886293750ec015d3e85"},
+    {"name": "4K TR: EUROSPORT 2 HD .b", "id": "41172279629184f8c9c408"},
+    {"name": "4K TR: EXXEN TV .b", "id": "1944695268eb5e2a66f22"},
+    {"name": "4K TR: FB TV .b", "id": "3730681078c11a26802932"},
+    {"name": "4K TR: FLASH TV .b", "id": "268701784160a0471a069f"},
+    {"name": "4K TR: FX HD .b", "id": "15614953198c1780c4df07"},
+    {"name": "4K TR: HABER GLOBAL HD .b", "id": "11966263871c480a66a299"},
+    {"name": "4K TR: HABERT RK HD .b", "id": "4253369376912583d237b6"},
+    {"name": "4K TR: HALK TV .b", "id": "1320391955e6c5bb1bedb6"},
+    {"name": "4K TR: KANAL 7 HD .b", "id": "109266795988e12fc489b6"},
+    {"name": "4K TR: KANAL D HD .b", "id": "16776796840463f6dcff41"},
+    {"name": "4K TR: KRT TV .b", "id": "3266397146eeea3bece51d"},
+    {"name": "4K TR: LKE TV HD .b", "id": "1839766333cbe160b34439"},
+    {"name": "4K TR: LOVE NATURE HD .b", "id": "3578706863eeeea821418e"},
+    {"name": "4K TR: M N KA GO .b", "id": "1230912428fed514f6312b"},
+    {"name": "4K TR: M N KA OCUK .b", "id": "248538205948705e1eeee"},
+    {"name": "4K TR: MELTEM TV .b", "id": "70038106882c930faaa1b"},
+    {"name": "4K TR: NATIONAL GEOGRAPHIC HD .b", "id": "10783553250ea885deefe4"},
+    {"name": "4K TR: NATIONAL GEOGRAPHIC WILD HD .b", "id": "1324166169d75d5197aa7"},
+    {"name": "4K TR: NBA TV HD .b", "id": "5455481338d50b246e682"},
+    {"name": "4K TR: NICKTOONS .b", "id": "988691374172058ef3d50"},
+    {"name": "4K TR: NOW HD .b", "id": "2578197593a87a0ba68631"},
+    {"name": "4K TR: NR1 DAMAR HD .b", "id": "2432556224e96906513616"},
+    {"name": "4K TR: NTV HD .b", "id": "2073292907cc209d200015"},
+    {"name": "4K TR: NUMBER1 TURK HD .b", "id": "40428875846b4e812374d1"},
+    {"name": "4K TR: NUMBER1 TV HD .b", "id": "152660259946902d02c5c6"},
+    {"name": "4K TR: POWER TV HD .b", "id": "130796566204d6973e458e"},
+    {"name": "4K TR: S NEMA 1002 HD .b", "id": "1076643856c5c88735393f"},
+    {"name": "4K TR: S NEMA A LE 2 HD .b", "id": "30005947634e6b4664fb0b"},
+    {"name": "4K TR: S NEMA A LE HD .b", "id": "698495811d90e484ca252"},
+    {"name": "4K TR: S NEMA AKS YON 2 HD .b", "id": "344071158009740df4a222"},
+    {"name": "4K TR: S NEMA KOMED HD .b", "id": "4407749499b6c2037cd18"},
+    {"name": "4K TR: S NEMA TV 1001 HD .b", "id": "27613851667b0cf470c1d7"},
+    {"name": "4K TR: S NEMA TV 2 HD .b", "id": "295060524599a0e2494fd"},
+    {"name": "4K TR: S NEMA TV AKS YON HD .b", "id": "2246993811df5da1c0152b"},
+    {"name": "4K TR: S NEMA TV HD .b", "id": "2780830033f62b9d4a4669"},
+    {"name": "4K TR: S NEMA YERL 2 HD .b", "id": "397160342723f52ab76e2e"},
+    {"name": "4K TR: S NEMA YERL HD .b", "id": "18971594736fd7a4c68deb"},
+    {"name": "4K TR: S SPORT .b", "id": "21232735984a3f0b463d66"},
+    {"name": "4K TR: S SPORT 2 .b", "id": "9369082742fdb8ca83c62"},
+    {"name": "4K TR: SHOW TV HD .b", "id": "8795889605c7795ac9528"},
+    {"name": "4K TR: SOZCU TV .b", "id": "960578312ee36cc17c5d2"},
+    {"name": "4K TR: SPOR SMART .b", "id": "3159604752e1cba547bb"},
+    {"name": "4K TR: SPORTS TV HD .b", "id": "2429298798dcd505d1ab4b"},
+    {"name": "4K TR: STAR TV HD .b", "id": "219297129315c074c03f8e"},
+    {"name": "4K TR: TELE1 .b", "id": "4179661802105c1488514b"},
+    {"name": "4K TR: TEVE2 HD .b", "id": "1917502631a9b6866e12b6"},
+    {"name": "4K TR: TGRT HABER HD .b", "id": "190715470454a282dd6577"},
+    {"name": "4K TR: TJK TV .b", "id": "27949369132f08a592203d"},
+    {"name": "4K TR: TRT 1 HD .b", "id": "1762199258e25181300f62"},
+    {"name": "4K TR: TRT 2 HD .b", "id": "38843190334c7e81c1c6fc"},
+    {"name": "4K TR: TRT 3 .b", "id": "418740351278f04c94b243"},
+    {"name": "4K TR: TRT AVAZ .b", "id": "2990410352438976430a38"},
+    {"name": "4K TR: TRT BELGESEL HD .b", "id": "786973656b665fa8beb18"},
+    {"name": "4K TR: TRT HABER HD .b", "id": "6036516388b222edb706e"},
+    {"name": "4K TR: TRT KURD .b", "id": "1216632307df2afc1919fa"},
+    {"name": "4K TR: TRT M Z K .b", "id": "970382162286220f5fa39"},
+    {"name": "4K TR: TRT OCUK HD .b", "id": "30291805064bacb8a4036d"},
+    {"name": "4K TR: TRT SPOR HD .b", "id": "22629699381f94fcd9dbe6"},
+    {"name": "4K TR: TRT SPOR YILDIZ .b", "id": "2750507083b8337c6b6616"},
+    {"name": "4K TR: TRT T RK .b", "id": "35084774810a78b091aa35"},
+    {"name": "4K TR: TV 4 .b", "id": "3574429625ab8ee4e1aaa"},
+    {"name": "4K TR: TV100 .b", "id": "3760496907c6df5dd98932"},
+    {"name": "4K TR: TV8 HD .b", "id": "2693299013444c726b1ee4"},
+    {"name": "4K TR: TV8,5 HD .b", "id": "18867436247890d4c5bd71"},
+    {"name": "4K TR: TVNET HD .b", "id": "1738739277a6ed7f08cfb3"},
+    {"name": "4K TR: VIASAT EXPLORE .b", "id": "1451950581e94c106d97f3"},
+    {"name": "4K TR: VIASAT HISTORY HD .b", "id": "1335130209de4b92f31496"},
+    {"name": "64 KARE ULKESI .b", "id": "384200326272e556e601b9"},
+    {"name": "A HABER .c", "id": "159609588253825d67ec56"},
+    {"name": "A HABER .s", "id": "1174108535f425095f15a6"},
+    {"name": "A HABER HD .b", "id": "535272601f07c2fbd1f2b"},
+    {"name": "A HABER HEVC .b", "id": "3766846723a124db6f6244"},
+    {"name": "A HABER RAW .b", "id": "2511732024145ccd20a5d3"},
+    {"name": "A NEWS .c", "id": "8121316298dfb2ba1be71"},
+    {"name": "A NEWS .s", "id": "1571071214f4fb96b462fe"},
+    {"name": "A NEWS HD .b", "id": "387890889759c06a2c4da1"},
+    {"name": "A NEWS RAW .b", "id": "3415462105074dc2b1d646"},
+    {"name": "A PARA .s", "id": "2318923445f9e08ad61d5f"},
+    {"name": "A PARA RAW .b", "id": "4202445834678957f05238"},
+    {"name": "A SPOR .c", "id": "81927269637ef82886825"},
+    {"name": "A SPOR .s", "id": "15619589713a6387b378e8"},
+    {"name": "A SPOR FHD .b", "id": "911836506e50aacc3a9e9"},
+    {"name": "A SPOR HD .b", "id": "2556711030587eed1d7123"},
+    {"name": "A SPOR HEVC .b", "id": "28805292086eedfe83d038"},
+    {"name": "A SPOR RAW .b", "id": "2777121053574bf4d1b799"},
+    {"name": "A2 .c", "id": "759245925a154b345865d"},
+    {"name": "A2 .s", "id": "173580685187013b4a1318"},
+    {"name": "A2 HD .b", "id": "867875861079562f15007"},
+    {"name": "A2 HEVC .b", "id": "128957614556bfb7e20bde"},
+    {"name": "A2 RAW .b", "id": "19057497795e890277f212"},
+    {"name": "A2 TV SD .b", "id": "1835847966e01d08f3ea1f"},
+    {"name": "ADA TV .b", "id": "42259617152e399e6d2ef0"},
+    {"name": "ADA TV .c", "id": "21347352852305a53dccfa"},
+    {"name": "ADANA TV .b", "id": "225124967e1e5b6a748e0"},
+    {"name": "ADIBESA MASALLARI .b", "id": "832790897b9f745becff8"},
+    {"name": "ADIYAMAN MERCAN TV .b", "id": "3055235391a02f432de784"},
+    {"name": "AFYON T RK TV .b", "id": "145755891783da06dac9f"},
+    {"name": "AFYON TURK .s", "id": "1782534194ec2d619f7548"},
+    {"name": "AGRO TV .c", "id": "163358782054d9002fa0b0"},
+    {"name": "AKILLI TAVSAN MOMO .s", "id": "4093001640e8d2942477e2"},
+    {"name": "AKIT TV .b", "id": "2702391715e85c3d67a4ee"},
+    {"name": "AKIT TV .c", "id": "194868101172e4362de24e"},
+    {"name": "AKIT TV .s", "id": "1862240206bdae999f9066"},
+    {"name": "AKLILI TV .s", "id": "3737299250dadf300b85e4"},
+    {"name": "AKSARAY KANAL 68 .b", "id": "9558066722545d9635261"},
+    {"name": "AKSU TV .c", "id": "2170702658173e1813ae19"},
+    {"name": "AKSU TV K MARAS .s", "id": "2914289476ab2b9b77fc43"},
+    {"name": "AKUSTIK .b", "id": "3728553873d44cfc7c12c6"},
+    {"name": "ALANYA POSTA TV .c", "id": "287303002844eef20b99c6"},
+    {"name": "ALEM FM RADYOLAND .b", "id": "19087142537ee96a6ffbf3"},
+    {"name": "ALEM RADYO .b", "id": "809445873afba8a319cea"},
+    {"name": "ALTAS TV .c", "id": "76941483786c9c7e5bf21"},
+    {"name": "ALTAS TV ORDU .s", "id": "730257349f3f3bc6d733a"},
+    {"name": "ALVIN .b", "id": "221800489857045f13242b"},
+    {"name": "ANADOLU DERNEK .s", "id": "1468389014c01ae6ad3546"},
+    {"name": "ANADOLU DERNEK TV .b", "id": "4274827801d7c79d4e1a26"},
+    {"name": "ANADOLU DERNEK TV .c", "id": "3978460736eee7cf5d26f1"},
+    {"name": "ANADOLU TV .c", "id": "1917558455120761543969"},
+    {"name": "ANAKKALE BOĞAZ TV .b", "id": "1943578223ce7cc4b1c284"},
+    {"name": "ANAKKALE TON TV .b", "id": "4250561695aeafaa1af43b"},
+    {"name": "ANGRY BIRDS .b", "id": "40635964179eb6e60f85f9"},
+    {"name": "ANIMAL PLANET HD .b", "id": "3913298991ebe0634b3649"},
+    {"name": "ANIMATION 1 HD .b", "id": "7274274379cbbe0c37b06"},
+    {"name": "ANIMAUX .b", "id": "2103702130b5451883e2a7"},
+    {"name": "ANKA TV .b", "id": "1570235694b073eb3546e5"},
+    {"name": "ANKARA T RKIYEM TV .b", "id": "1443355363db5023a8a584"},
+    {"name": "ANLIURFA KANAL URFA .b", "id": "7548683513f8b3f808009"},
+    {"name": "ANTALYA KANAL V .b", "id": "19407670052f2ca6260436"},
+    {"name": "APARA HD .b", "id": "9314064096e814315889b"},
+    {"name": "ARTI TV .s", "id": "2593700321f6cc24be874"},
+    {"name": "AS TV BURSA .c", "id": "1889158339289b18ba407c"},
+    {"name": "AS TV BURSA .s", "id": "20845874371f2603935ccd"},
+    {"name": "ASLAN TV .b", "id": "2042734050f45f3ec58fcb"},
+    {"name": "ATV .c", "id": "4559304258567c5d6cd2a"},
+    {"name": "ATV .s", "id": "125559433707e42d1e715f"},
+    {"name": "ATV ALANYA .c", "id": "930209556b86e711a1922"},
+    {"name": "ATV AVRUPA .c", "id": "31959103511474b82d3792"},
+    {"name": "ATV EUROPA .b", "id": "9008513956c6b4eb4e05"},
+    {"name": "ATV FHD .b", "id": "28610106416f22e0cc8dbc"},
+    {"name": "ATV HD .b", "id": "1332310706d6138ade7950"},
+    {"name": "ATV HD (H265) .b", "id": "129909794290450d5e2d1"},
+    {"name": "ATV HEVC .b", "id": "35111504916c34560a3894"},
+    {"name": "ATV PARA .c", "id": "35203232920408e8a99af5"},
+    {"name": "ATV RAW .b", "id": "962169494c61eb5a2ee2f"},
+    {"name": "ATV SD .b", "id": "64543153093b2057929eb"},
+    {"name": "AUTOMOTO (FR) .s", "id": "3033512963c208a7f26dc2"},
+    {"name": "AV TV .s", "id": "334323069104712e8a0a89"},
+    {"name": "BABA RADYO ARABESK .b", "id": "40965694547a9def110e6c"},
+    {"name": "BABY TV .c", "id": "382042085583b289bf81e2"},
+    {"name": "BABY TV .s", "id": "41848652906e4c7a933f55"},
+    {"name": "BABY TV HD .b", "id": "27516589959a967260542d"},
+    {"name": "BARBAROS TV .b", "id": "1519411021283d08ac01c6"},
+    {"name": "BARBIE ANIMATION 2 HD .b", "id": "280573123054a8c61dd62"},
+    {"name": "BBC EARTH .c", "id": "2618455562938e9a0e0faf"},
+    {"name": "BBC EARTH .s", "id": "261373161436ead236ae50"},
+    {"name": "BBC EARTH HD .b", "id": "22284968562a623d1b95b4"},
+    {"name": "BEIN 1 FEED (720P) .b", "id": "1363827223a1c98515d612"},
+    {"name": "BEIN 1 SD (360P) .b", "id": "3692337241ec1b0872b06e"},
+    {"name": "BEIN 1 SD (480P) .b", "id": "2919229346c4e9a95ddb3f"},
+    {"name": "BEIN BOX OFFICE 1 .c", "id": "29307461023dd1f85985b0"},
+    {"name": "BEIN BOX OFFICE 1 .s", "id": "1320363850bcb8f1b5542a"},
+    {"name": "BEIN BOX OFFICE 2 .c", "id": "391012970274e1f1b46029"},
+    {"name": "BEIN BOX OFFICE 2 .s", "id": "152264090d704f6769888"},
+    {"name": "BEIN BOX OFFICE 3 .c", "id": "35641061340ab1a36ee3bd"},
+    {"name": "BEIN BOX OFFICE 3 .s", "id": "8799816103c5f180837cf"},
+    {"name": "BEIN GURME .c", "id": "361703541447c2d8cea904"},
+    {"name": "BEIN GURME .s", "id": "35832308581a7336e4ddeb"},
+    {"name": "BEIN GURME HD .b", "id": "9503946561e741aaf1f5f"},
+    {"name": "BEIN IZ .c", "id": "16912230784a73b11d66ed"},
+    {"name": "BEIN IZ TV .s", "id": "31561783590bdea7d4bf69"},
+    {"name": "BEIN MOVIES ACTION .c", "id": "18734781311354b28a35dd"},
+    {"name": "BEIN MOVIES ACTION .s", "id": "30412456070b17d981e0ff"},
+    {"name": "BEIN MOVIES ACTION 2 .c", "id": "26173183867663c6c36018"},
+    {"name": "BEIN MOVIES ACTION 2 .s", "id": "650851542129b8a3280b6"},
+    {"name": "BEIN MOVIES FAMILY .c", "id": "2485199152f30b65834b87"},
+    {"name": "BEIN MOVIES FAMILY .s", "id": "1322228068fac90faea203"},
+    {"name": "BEIN MOVIES PREMIERE .c", "id": "94298722454d1a7fefabb"},
+    {"name": "BEIN MOVIES PREMIERE .s", "id": "21977479648205db1b3061"},
+    {"name": "BEIN MOVIES PREMIERE 2 .c", "id": "22440690938318303270a5"},
+    {"name": "BEIN MOVIES PREMIERE 2 .s", "id": "2120218356a82436bd0e59"},
+    {"name": "BEIN MOVIES STARS .c", "id": "250091316466da3ef72786"},
+    {"name": "BEIN MOVIES STARS .s", "id": "19637487849304979bfdcb"},
+    {"name": "BEIN MOVIES TURK .c", "id": "33905759489e0915a21ca8"},
+    {"name": "BEIN MOVIES TURK .s", "id": "1835579025e6a7c2daa604"},
+    {"name": "BEIN SERIES 1 .c", "id": "2190922298d7f7ef0a716a"},
+    {"name": "BEIN SERIES 2 .c", "id": "33086937382c63181dc831"},
+    {"name": "BEIN SERIES 3 .c", "id": "4166418778d126ec592afc"},
+    {"name": "BEIN SERIES 4 .c", "id": "1249271114781b9186b725"},
+    {"name": "BEIN SERIES COMEDY .s", "id": "1668144911142c3ab6cc28"},
+    {"name": "BEIN SERIES DRAMA .s", "id": "727975195a22d80d147d6"},
+    {"name": "BEIN SERIES SCI-FI .s", "id": "3016529666fa8445d49f2d"},
+    {"name": "BEIN SERIES VICE .s", "id": "11255232621b7b0443ab0d"},
+    {"name": "BEIN SPORTS 1 .c", "id": "300113394ceebba66c8ad"},
+    {"name": "BEIN SPORTS 1 (720P) .b", "id": "38404756531618c87fcc66"},
+    {"name": "BEIN SPORTS 1 (720PFEED) .b", "id": "22330664333ebb4acbb6ab"},
+    {"name": "BEIN SPORTS 1 [LIVE DURING EVENTS ONLY] .s", "id": "342898470360b159ef8301"},
+    {"name": "BEIN SPORTS 1 + .b", "id": "2576216897d1c2b14af4e9"},
+    {"name": "BEIN SPORTS 1 50 FPS .b", "id": "13524210538e192d878d20"},
+    {"name": "BEIN SPORTS 1 FEED .c", "id": "2729088606df69156b1eda"},
+    {"name": "BEIN SPORTS 1 H265 .b", "id": "24034250314fd9aa349685"},
+    {"name": "BEIN SPORTS 1 HD .b", "id": "66217962033a2d3e9c47f"},
+    {"name": "BEIN SPORTS 1 HD (TURKEY) .b", "id": "5934938605e361d7e0ff0"},
+    {"name": "BEIN SPORTS 2 .c", "id": "1447241506bdccfad8b85c"},
+    {"name": "BEIN SPORTS 2 .s", "id": "250946619196f7d48e5d74"},
+    {"name": "BEIN SPORTS 2 HD .b", "id": "28515391437e928cafd5dd"},
+    {"name": "BEIN SPORTS 2 SD .b", "id": "323636291171b2af97d745"},
+    {"name": "BEIN SPORTS 2 UHD .b", "id": "3694662475a36c53181838"},
+    {"name": "BEIN SPORTS 3 .c", "id": "179745960216563080394f"},
+    {"name": "BEIN SPORTS 3 .s", "id": "2834514943d9fcc1df9594"},
+    {"name": "BEIN SPORTS 3 HD .b", "id": "17005958018c5d23b49ef0"},
+    {"name": "BEIN SPORTS 3 SD .b", "id": "206371329905d7f81fb9d"},
+    {"name": "BEIN SPORTS 3 UHD .b", "id": "3410167560f6960a0d6de9"},
+    {"name": "BEIN SPORTS 4 .c", "id": "3640906370384c4c528e99"},
+    {"name": "BEIN SPORTS 4 .s", "id": "450076655d706ff73e384"},
+    {"name": "BEIN SPORTS 4 HD .b", "id": "1872232768c7c65ceb9862"},
+    {"name": "BEIN SPORTS 4 UHD .b", "id": "2938268353a63a37b4528e"},
+    {"name": "BEIN SPORTS 4K FEED(KUTU) .b", "id": "267105889a25a483e5e80"},
+    {"name": "BEIN SPORTS 4K FEED(UYDU) .b", "id": "1536730627bbf8f95ca477"},
+    {"name": "BEIN SPORTS 5 .c", "id": "3831757618ff599ed6d68c"},
+    {"name": "BEIN SPORTS 5 (MATCH TIME) .s", "id": "12304481920a92c9204dcd"},
+    {"name": "BEIN SPORTS 5 FHD .b", "id": "400031560175e3479a3f11"},
+    {"name": "BEIN SPORTS 5 HD .b", "id": "2737963486b4d9c437a945"},
+    {"name": "BEIN SPORTS 720P FEED .b", "id": "499485497d6131f47417d"},
+    {"name": "BEIN SPORTS 8K FEED .b", "id": "2113462398d8dd57a8ea73"},
+    {"name": "BEIN SPORTS FEED (OZEL FEED YAYIN) .b", "id": "1453692314f52730c50395"},
+    {"name": "BEIN SPORTS HABER .c", "id": "1197336000e1b7dd01506d"},
+    {"name": "BEIN SPORTS HABER .s", "id": "280607961285361f558fc8"},
+    {"name": "BEIN SPORTS HABER HD .b", "id": "3989995533d0efea1c8696"},
+    {"name": "BEIN SPORTS HABER RAW .b", "id": "164663282518e6179f90af"},
+    {"name": "BEIN SPORTS MAX 1 .c", "id": "1221587067c43d5b265b10"},
+    {"name": "BEIN SPORTS MAX 1 .s", "id": "283243053554cc6eb0a10a"},
+    {"name": "BEIN SPORTS MAX 1 FHD .b", "id": "4071474743dbe8a60b9395"},
+    {"name": "BEIN SPORTS MAX 1 HD .b", "id": "22528142332d275721233"},
+    {"name": "BEIN SPORTS MAX 2 .c", "id": "25896823596a84e43dd09"},
+    {"name": "BEIN SPORTS MAX 2 .s", "id": "4017295127660d677c32f9"},
+    {"name": "BEIN SPORTS MAX 2 FHD .b", "id": "3407936242f95c33ae8820"},
+    {"name": "BEIN SPORTS MAX 2 HD .b", "id": "2212659820b109b476a4d3"},
+    {"name": "BEIN SPOTS1 SD .b", "id": "143239535a2e3c23c1d16"},
+    {"name": "BEN 10 TV .b", "id": "3270480503ae6e3f607164"},
+    {"name": "BENGU TURK .c", "id": "3030241554f63b28d76ab2"},
+    {"name": "BENGUTURK .s", "id": "3677880546b91991c857cd"},
+    {"name": "BEST ANIMASYON .b", "id": "182242511854592ad20a83"},
+    {"name": "BEST BILIMKURGU .b", "id": "1566323467670298603f5b"},
+    {"name": "BEST DRAM .b", "id": "4099015608239c33b463bc"},
+    {"name": "BEST FM T RK E POP .b", "id": "2591986518ae00754c4ef2"},
+    {"name": "BEST HABABAM SINIFI .b", "id": "4228481876db7dd6acf5b"},
+    {"name": "BEST IMBD .b", "id": "19675163050cdefd6160c5"},
+    {"name": "BEST KOMEDI .b", "id": "17233265984e83c5ef5947"},
+    {"name": "BEST KORKU .b", "id": "2298271695faed3c96249f"},
+    {"name": "BEST LOCA 1 .b", "id": "1063857052f07e2eec0c52"},
+    {"name": "BEST LOCA 2 .b", "id": "20264594681bd1479ca3f0"},
+    {"name": "BEST NETFLIX .b", "id": "35317279904b909276b540"},
+    {"name": "BEST SALON 1 .b", "id": "2585357317352fbfd92833"},
+    {"name": "BEST SALON 2 .b", "id": "37198947412070cf7796ed"},
+    {"name": "BEST SALON 3 .b", "id": "37723339252eec59344208"},
+    {"name": "BEST SAVAS .b", "id": "13586163859ba90852bd44"},
+    {"name": "BEST TURK .b", "id": "11961982805779396d2f21"},
+    {"name": "BEYAZ HD+ SD .b", "id": "1020985035552180fe7152"},
+    {"name": "BEYAZ TV .c", "id": "34182375310e960a426e1c"},
+    {"name": "BEYAZ TV .s", "id": "2758508882dd33978c7a5"},
+    {"name": "BEYAZ TV FHD .b", "id": "16003488113ad5cdfa73f1"},
+    {"name": "BEYAZ TV HD .b", "id": "2755756005a4ea6e7589ca"},
+    {"name": "BEYAZ TV HEVC .b", "id": "15107839012fa9f66fac00"},
+    {"name": "BEYAZ TV RAW .b", "id": "34349646843bc2da28db11"},
+    {"name": "BILGILENDIRME .b", "id": "2224047651b7df1fd1adc5"},
+    {"name": "BIR TV .c", "id": "25407700892aa536e1a9ff"},
+    {"name": "BLOOMBERG .s", "id": "260322414100d6583c3f2b"},
+    {"name": "BLOOMBERG HT HD .b", "id": "236989031b5bce3e87ca9"},
+    {"name": "BLOOMBERG HT HD+ SD .b", "id": "2563486225460803675883"},
+    {"name": "BLOOMBERGHT HD .b", "id": "8585683074b88a84fea71"},
+    {"name": "BLOOMBERGHT RAW .b", "id": "35781502601487862e9ea4"},
+    {"name": "BONUS MASAL DIYARI .b", "id": "1753590086d14bf2945f0e"},
+    {"name": "BOOBA TV .b", "id": "2703864948c3ea529a2063"},
+    {"name": "BOOMERANG .s", "id": "29439742084c66e3a8bcec"},
+    {"name": "BOOMERANG HD .b", "id": "11743931b356e8661a4d"},
+    {"name": "BRT 1 .c", "id": "2793254316da8e310eaaf8"},
+    {"name": "BRT 1 .s", "id": "364095191839fa6d57aead"},
+    {"name": "BRT 1 RAW .b", "id": "2667659514909fbe1801e3"},
+    {"name": "BRT 2 .c", "id": "37894122206a5d105c20d3"},
+    {"name": "BRT 2 .s", "id": "26616132460497e495a648"},
+    {"name": "BRT 2 RAW .b", "id": "2794224703b2cc3f4b330e"},
+    {"name": "BRT 3 .b", "id": "1840145851828723ba90ac"},
+    {"name": "BRTV .c", "id": "134086061839e644f1eaa"},
+    {"name": "BULMACA KULESI .b", "id": "910953672551cfa880ee0"},
+    {"name": "CAILLOU .c", "id": "4136709820104f9b927f66"},
+    {"name": "CAILLOU TV .b", "id": "24628387059d91397376ea"},
+    {"name": "CAILLOU TV .s", "id": "36262892309c36be6d6419"},
+    {"name": "CAN TV .b", "id": "182252574160a3b3c54187"},
+    {"name": "CAN TV .c", "id": "3900702315d5891138ec1d"},
+    {"name": "CAN TV .s", "id": "2243133352b18bb6823656"},
+    {"name": "CANIM KARDESIM TV .b", "id": "37370371587d37e629c448"},
+    {"name": "CARTOON NETWORK .c", "id": "16965737237b7911f24b84"},
+    {"name": "CARTOON NETWORK .s", "id": "47854903297efb645a3fe"},
+    {"name": "CARTOON NETWORK HD .b", "id": "13136008519d72a40b3d39"},
+    {"name": "CARTOONITO .c", "id": "178755989915511fee27c"},
+    {"name": "CAY TV .c", "id": "26509164417c662aa52778"},
+    {"name": "CAY TV .s", "id": "4090316698975ac8a762bd"},
+    {"name": "CBEEBIES HD .b", "id": "267285118531e87b6ae01d"},
+    {"name": "CEM TV .s", "id": "145648263137480837677c"},
+    {"name": "CHASSE ET PECHE .s", "id": "1475763901a25da27651f"},
+    {"name": "CHICKY TV .b", "id": "940839479e2753e3433f5"},
+    {"name": "CIFTCI TV .c", "id": "3124431103898180a5f0f6"},
+    {"name": "CIFTCI TV .s", "id": "318577866765847010459c"},
+    {"name": "CILGIN ORMAN TV .b", "id": "3892774129e556db3be974"},
+    {"name": "CNN T RK HD+ SD .b", "id": "28683185347b6a700744ac"},
+    {"name": "CNN T RK HEVC .b", "id": "2311285186e1b48c06b6ab"},
+    {"name": "CNN T RK RAW .b", "id": "3583754923288bb21bc8bc"},
+    {"name": "CNN TURK .c", "id": "41338152650143743f9d7"},
+    {"name": "CNN TURK .s", "id": "3278683973d0eaa4e57d76"},
+    {"name": "CNN TURK HD .b", "id": "427315396743dfe9212c50"},
+    {"name": "COCUK 1 HD .b", "id": "204606561e2a864b42de1"},
+    {"name": "COCUK 2 HD .b", "id": "21934273300186e4b0974f"},
+    {"name": "COCUK 3 HD .b", "id": "1310133020ac356e7be28a"},
+    {"name": "ÇOCUK SMART .c", "id": "1884291733f97af60f283a"},
+    {"name": "COSMOSPORTS .c", "id": "272589841560325bb17902"},
+    {"name": "D Ğ N TV (GERMANY) .b", "id": "2660902091c248c72d0cd6"},
+    {"name": "DA VINC KIDS HD .b", "id": "3983067532b2b6b5e2298f"},
+    {"name": "DA VINCI .c", "id": "220576533165e4633695d4"},
+    {"name": "DA VINCI LEARNING .s", "id": "1268465409d81cf808f3af"},
+    {"name": "DEHA TV .c", "id": "94949908631a603d90cd8"},
+    {"name": "DEHA TV .s", "id": "5746975234c4c28f5dbe1"},
+    {"name": "DENIZ POSTASI TV .c", "id": "183207521594fc65b3f956"},
+    {"name": "DENIZLI DEHA TV .b", "id": "23018905930073141351c"},
+    {"name": "DHA .c", "id": "40223592760f0af9f37d41"},
+    {"name": "DIGI MAX .s", "id": "127844757686ca7d664ae5"},
+    {"name": "DIGI MAX 2 .s", "id": "1104559360fc7735351211"},
+    {"name": "DIM TV .c", "id": "1072972009ade9e4b4a779"},
+    {"name": "DINAMIK AKSIYON .b", "id": "2337350974aa27a20a6514"},
+    {"name": "DINAMIK ANIMASYON .b", "id": "231764826926671978818a"},
+    {"name": "DINAMIK BILIMKURGU .b", "id": "8847660680807874b7aa4"},
+    {"name": "DINAMIK DRAM .b", "id": "2706562550a39918648f3c"},
+    {"name": "DINAMIK IMBD .b", "id": "541406431f598c1d4030c"},
+    {"name": "DINAMIK KOMEDI .b", "id": "1764108510f341d0b9b2b3"},
+    {"name": "DINAMIK KORKU .b", "id": "4329132861bddbfa6bb96"},
+    {"name": "DINAMIK LOCA-2 .b", "id": "34187865064a204ff41a44"},
+    {"name": "DINAMIK MARVEL .b", "id": "1558936074bb68c1ebd9d1"},
+    {"name": "DINAMIK SALON 10 .b", "id": "8581098306450c5288149"},
+    {"name": "DINAMIK SALON 2 .b", "id": "3087425243bf3245bad1b8"},
+    {"name": "DINAMIK SALON 3 .b", "id": "22380849718a0ed2c58026"},
+    {"name": "DINAMIK SALON 5 .b", "id": "170296011940606b9f7c5"},
+    {"name": "DINAMIK SALON 6 .b", "id": "1300690971b5fda3365ce5"},
+    {"name": "DINAMIK SALON 9 .b", "id": "3486937034005c38af9328"},
+    {"name": "DINAMIK SAVAS .b", "id": "325135437625cc1cbafeac"},
+    {"name": "DINAMIK SENER SEN .b", "id": "2809722762b426d7133501"},
+    {"name": "DINAMIK TURK .b", "id": "306993094f3cd5715860a"},
+    {"name": "DINAMIK UZAKDOGU .b", "id": "25718122083092d2f2bb94"},
+    {"name": "DINAMIK VIZYON .b", "id": "3331045719b0c99b128adf"},
+    {"name": "DINAMIK WESTERN .b", "id": "7269150727f343c6d0f13"},
+    {"name": "DINAMIK YESILCAM .b", "id": "10475251689d5a1f09d886"},
+    {"name": "DISCOVERY CHANNEL .s", "id": "3079995901347079e2f045"},
+    {"name": "DISCOVERY CHANNEL HD+ .b", "id": "6957057788f10364acdac"},
+    {"name": "DISCOVERY ID .b", "id": "20954040600611bde9e160"},
+    {"name": "DISCOVERY ID .s", "id": "972730032fe506471c990"},
+    {"name": "DISCOVERY IDX HD .b", "id": "9700986623c97a7651f69"},
+    {"name": "DISCOVERY SCIENCE .s", "id": "369885232360b4a1528ab4"},
+    {"name": "DISCOVERY SCIENCE HD+ .b", "id": "2818684271ea7ddc0e09ff"},
+    {"name": "DISCOVERY WORLD .c", "id": "3624002307d3a1f474d7ce"},
+    {"name": "DISNEY CHANNEL .s", "id": "1161899432db055970dd1d"},
+    {"name": "DISNEY CHANNEL HD .b", "id": "3578544716a4cc42d03dcd"},
+    {"name": "DISNEY JR .s", "id": "396367809728cc9e22209f"},
+    {"name": "DISNEY JR HD .b", "id": "4108765291d43a8a0a8088"},
+    {"name": "DISNEY JR HD+ .b", "id": "1772892321058f7001d327"},
+    {"name": "DISNEY XD HD .b", "id": "34228536805e87ad5629aa"},
+    {"name": "DIYANET TV .b", "id": "939027674e949a778ccc0"},
+    {"name": "DIYANET TV .c", "id": "2131958841c54888546e7f"},
+    {"name": "DIYAR TV .c", "id": "4252763849da396737d0fb"},
+    {"name": "DIZI SMART MAX .s", "id": "4079530614c947cd16dfeb"},
+    {"name": "DIZI SMART PREMIUM .s", "id": "791616758a9307c539baa"},
+    {"name": "DIZISMART MAX .c", "id": "1165201807c63adbefc9d9"},
+    {"name": "DIZISMART PREMIUM .c", "id": "1195429280e03f87d3589d"},
+    {"name": "DMAX .c", "id": "315721043612919a3e4725"},
+    {"name": "DMAX .s", "id": "3239529951d63b20c43f8b"},
+    {"name": "DMAX HD .b", "id": "1595495667292319e147ce"},
+    {"name": "DMAX HEVC .b", "id": "3928493138c10993284095"},
+    {"name": "DOCUBOX .c", "id": "26690245101fd09556fb3d"},
+    {"name": "DOCUBOX HD .b", "id": "36503860629402933193b7"},
+    {"name": "DORU TV .b", "id": "999352745436d793f30dc"},
+    {"name": "DOST TV .b", "id": "3762421108d8f2958be035"},
+    {"name": "DOST TV .c", "id": "896813028168206a0e06b"},
+    {"name": "DOST TV .s", "id": "799884057e7cb32a0489c"},
+    {"name": "DREAM BEIN OFFICE 1 .b", "id": "2759159211bf8b5c4a304d"},
+    {"name": "DREAM BEIN OFFICE 3 .b", "id": "373642004344d287985a44"},
+    {"name": "DREAM BEIN OFFICE 4 .b", "id": "1821762267544ae2fe57ce"},
+    {"name": "DREAM BEIN OFFICE 5 .b", "id": "1375062891fd10d8fd2891"},
+    {"name": "DREAM BEIN OFFICE 6 .b", "id": "374714811264e77de4f16"},
+    {"name": "DREAM BEIN OFFICE 7 .b", "id": "7249326193e69ecc36187"},
+    {"name": "DREAM BEIN OFFICE 8 .b", "id": "28419726988ea14fc81958"},
+    {"name": "DREAM BEIN OFFICE 9 .b", "id": "2483365482c48056254ba2"},
+    {"name": "DREAM DRAM .b", "id": "3548409764f53722499655"},
+    {"name": "DREAM KEMAL SUNAL .b", "id": "95010505e71c34846cce"},
+    {"name": "DREAM KORKU .b", "id": "263155556411d21a29172d"},
+    {"name": "DREAM LOCA 1 .b", "id": "263575868806b9d7bd7df4"},
+    {"name": "DREAM LOCA 2 .b", "id": "3669624496050e9be68346"},
+    {"name": "DREAM LOCA 3 .b", "id": "3889835776671d9bb9a169"},
+    {"name": "DREAM NETFLIX .b", "id": "1713907990c1517cdc70d9"},
+    {"name": "DREAM TURK .b", "id": "16210261966fbffa31e76a"},
+    {"name": "DREAM TURK .c", "id": "6787946153f4f9e30bf05"},
+    {"name": "DREAM TURK .s", "id": "712098411f4dd9def5cdc"},
+    {"name": "DREAM TURK (BACKUP) .b", "id": "25570906953e78b3acadc6"},
+    {"name": "DREAM TV .b", "id": "1383473435135cf669b662"},
+    {"name": "DREAM WESTERN .b", "id": "41988499024059e546ac2f"},
+    {"name": "DUCU BOX .b", "id": "1107525733e42b6c7abd3"},
+    {"name": "EBA TV ILKOKUL .c", "id": "33161891950c14c113ca86"},
+    {"name": "EBA TV LISE .c", "id": "361456541062c1025d3d2b"},
+    {"name": "EBA TV ORTAOKUL .c", "id": "375152762211b2a1adeae9"},
+    {"name": "EDESSA TV .c", "id": "215449252887e52acd6803"},
+    {"name": "EDIRNE ETV .b", "id": "658726604ae88a8e690ef"},
+    {"name": "EFKAR FM CANLI RADYO .b", "id": "2156922182c4160baf6fa4"},
+    {"name": "EGE ILE GAGA .b", "id": "36508969020f6d070f25ea"},
+    {"name": "EGE ILE GAGA .s", "id": "2625879722d77e234c308c"},
+    {"name": "EGE TURK TV .b", "id": "4225938876155a05d54219"},
+    {"name": "EKIN T RK TV .b", "id": "6574952728e780b291cc7"},
+    {"name": "EKIN TURK .c", "id": "666401379556f17cdcc8c"},
+    {"name": "EKO TURK .s", "id": "2999246297c78de5c9a770"},
+    {"name": "EKOL TV .b", "id": "344864184580cfb37ab0e3"},
+    {"name": "EKOL TV .c", "id": "4149503096e9b1d7aef47"},
+    {"name": "EKOL TV (BACKUP) .b", "id": "19731155d71f5a4ab128"},
+    {"name": "EKOL TV SD .b", "id": "3549408298cd9c66d628e9"},
+    {"name": "EKOTURK .c", "id": "12014567934c0bd95e7df8"},
+    {"name": "EKOTURK HD .b", "id": "71194427284d165c9835e"},
+    {"name": "ELAZIG KANAL 23 .b", "id": "350404585796b6d306497a"},
+    {"name": "ELAZIG KANAL FIRAT .b", "id": "634397776501ceff80d97"},
+    {"name": "ELIF VE ARKADASLARI .b", "id": "3515455741a6f5d78304a1"},
+    {"name": "ELIFIN DUSLERI .s", "id": "24063236237528e0650313"},
+    {"name": "ELIFIN RUYASI .b", "id": "399108163294dea6002810"},
+    {"name": "ENO AKSIYON 1 .s", "id": "633768195851d6f914620"},
+    {"name": "ENO ANIMASYON .s", "id": "38337533385e11d005954b"},
+    {"name": "ENO VIZYON 1 .s", "id": "1949742603d0b9dbc5b085"},
+    {"name": "ENO VIZYON 10 .s", "id": "16353843521c8bc85d3257"},
+    {"name": "ENO VIZYON 12 .s", "id": "4651538568e42f350ebd2"},
+    {"name": "ENO VIZYON 15 .s", "id": "284540603246df8257572c"},
+    {"name": "ENO VIZYON 3 .s", "id": "251061611b2926c45182b"},
+    {"name": "ENO VIZYON 4 .s", "id": "3168156027bde20e7a30ce"},
+    {"name": "ENO VIZYON 5 .s", "id": "2176192715addf7772f995"},
+    {"name": "ENO VIZYON 7 .s", "id": "4218831787cff46d390bb0"},
+    {"name": "ENO VIZYON 8 .s", "id": "2032587898f7a29565e065"},
+    {"name": "ENO VIZYON 9 .s", "id": "1145503178453c24f6b22a"},
+    {"name": "ENO WESTERN .s", "id": "1134525301f8ecc928b4b1"},
+    {"name": "ER TV .b", "id": "34986587209d7d94f684e5"},
+    {"name": "ERCIS TV .c", "id": "29014575503efc1f62c0c9"},
+    {"name": "ERTV .c", "id": "221836468186fc17b1865"},
+    {"name": "ERZURUM WEB TV .c", "id": "1736962708902f1c3b6ce3"},
+    {"name": "ES TV (ESKISEHIR) .c", "id": "1670462361617c4d6f0099"},
+    {"name": "ES TV (ESKISEHIR) .s", "id": "22071045493785e57aaf9a"},
+    {"name": "ESK EH R KANAL 26 .b", "id": "409014197869da0d767e2b"},
+    {"name": "ETV KAYSERI .c", "id": "1218353983e56ceae753c3"},
+    {"name": "ETV MANISA .c", "id": "20249540025118ba1bc88c"},
+    {"name": "EURO D .b", "id": "12904348901e32ae2c8ead"},
+    {"name": "EURO D .c", "id": "3358854668939e09403c17"},
+    {"name": "EURO D .s", "id": "278453038314cbbadcd2ca"},
+    {"name": "EURO STAR .b", "id": "1827094680ef16ad2f8b38"},
+    {"name": "EURO STAR .s", "id": "38145219358d998f180862"},
+    {"name": "EUROSPORT 1 .c", "id": "34586314617a4110b16336"},
+    {"name": "EUROSPORT 1 .s", "id": "3271328843ca1abfbfa420"},
+    {"name": "EUROSPORT 2 .c", "id": "2307325429068c8e128ae6"},
+    {"name": "EUROSPORT 2 [LIVE DURING EVENTS ONLY] .s", "id": "1309778674228351c44311"},
+    {"name": "EUROSPORT1 HD .b", "id": "3793200644fd418f955402"},
+    {"name": "EUROSPORT2 HD .b", "id": "1821942247abefa6aae14b"},
+    {"name": "EUROSTAR .c", "id": "21476140819198063bb491"},
+    {"name": "EXXEN SPOR 1 SD .b", "id": "20245689820af9ca3911b8"},
+    {"name": "EXXEN SPORTS 1 .c", "id": "11882580665f12f932d6c9"},
+    {"name": "EXXEN SPORTS 1 .s", "id": "1842018252a99ee10aa7f4"},
+    {"name": "EXXEN SPORTS 2 .c", "id": "24320962ff3ce3209657"},
+    {"name": "EXXEN SPORTS 2 [LIVE DURING EVENTS ONLY] .s", "id": "396148010898f34add6b9d"},
+    {"name": "EXXEN SPORTS 3 [LIVE DURING EVENTS ONLY] .s", "id": "3807939453af427a7aa295"},
+    {"name": "EXXEN SPORTS 4 .s", "id": "27710240609c46572439c0"},
+    {"name": "EXXEN SPORTS 5 .s", "id": "2555007244d10a40e57838"},
+    {"name": "EXXEN SPORTS 7 .s", "id": "38006954042bb57163b020"},
+    {"name": "EXXEN SPORTS 8 .s", "id": "1624937917c024524dfe03"},
+    {"name": "EXXEN TV .c", "id": "2426097659dac0cbc72851"},
+    {"name": "EXXEN TV SPOR 1 .b", "id": "1208369995ee56db60c6cb"},
+    {"name": "EXXEN TV SPOR 1 720P .b", "id": "3333902867e8eeb6c13355"},
+    {"name": "EXXEN TV SPOR 1 FEED .b", "id": "10914039127b6d2cb4f9b1"},
+    {"name": "EXXEN TV SPOR 1 HD .b", "id": "12042008015aa1fc47965f"},
+    {"name": "EXXEN TV SPOR 1 UHD .b", "id": "3814925371b27457afc78f"},
+    {"name": "EXXEN TV SPOR 2 HD .b", "id": "3377046146a9c27858fc04"},
+    {"name": "EXXEN TV SPOR 2 UHD .b", "id": "3673037054bbf23da360dd"},
+    {"name": "EXXEN TV SPOR 3 .b", "id": "851841067026eb6346001"},
+    {"name": "EXXEN TV SPOR 4 .b", "id": "21626092115c96093842ed"},
+    {"name": "EXXEN TV SPOR 5 .b", "id": "3179734411cc8e59810aba"},
+    {"name": "EXXEN TV SPOR 6 .b", "id": "4196835163f7f34378737d"},
+    {"name": "EXXEN TV SPOR 7 .b", "id": "3343300331c5663b93a430"},
+    {"name": "EXXEN TV SPOR 8 .b", "id": "11590782026618befbb16b"},
+    {"name": "FASIL NEVIZADE GECELERI .b", "id": "3597878428da15fa9fa57e"},
+    {"name": "FB TV .b", "id": "25123405584d863ac39980"},
+    {"name": "FB TV .c", "id": "61530860186f238127811"},
+    {"name": "FB TV .s", "id": "1540748539780d20f1eec6"},
+    {"name": "FILBOX SPOR 1 MACZAMANI .b", "id": "407612267f0a9074e199a"},
+    {"name": "FILBOX SPOR 3 MACZAMANI .b", "id": "2966231802972fc1b9caad"},
+    {"name": "FILMBOX AKSIYON .s", "id": "113035273098bcceb3f35a"},
+    {"name": "FILMBOX COMEDY .s", "id": "2089556265d959858b1ebc"},
+    {"name": "FILMBOX FANTASTIC .s", "id": "2267707661be2c4fd70fae"},
+    {"name": "FILMBOX KADIR INANIR .s", "id": "32680855471ee2bf28284f"},
+    {"name": "FILMBOX+ .s", "id": "260038761527e7e36c9554"},
+    {"name": "FINEST TV .c", "id": "2663765748ad351c6aadb3"},
+    {"name": "FIX CINEMA ACTION .b", "id": "140294889322f1c6411b3"},
+    {"name": "FIX CINEMA BILM KURGU .b", "id": "2480231926f2f22c708b52"},
+    {"name": "FIX CINEMA COMEDY .b", "id": "4140720869cce516830b81"},
+    {"name": "FIX CINEMA DRAM .b", "id": "28307635919edc269b7898"},
+    {"name": "FIX CINEMA FANTASTIC .b", "id": "245974733236c199cd8233"},
+    {"name": "FIX CINEMA KORKU .b", "id": "277891079147ee107a816f"},
+    {"name": "FIX CINEMA MACERA .b", "id": "29580754430ca9027bad74"},
+    {"name": "FIX CINEMA NETFLIX .b", "id": "32169858008c38299c49bf"},
+    {"name": "FIX CINEMA YERLI .b", "id": "239201347a28a02eb2603"},
+    {"name": "FIX CINEMA YESILCAM .b", "id": "411086166261597686dd33"},
+    {"name": "FLASH HABER TV .c", "id": "3806979011e0d72cfb10fc"},
+    {"name": "FLASH TV HD .b", "id": "20273310967517aba18b29"},
+    {"name": "FM TV .b", "id": "1285510370f329ebb236e7"},
+    {"name": "FM TV .c", "id": "425386382940c3dc27dbf2"},
+    {"name": "FMTV .b", "id": "3681963823264351faabac"},
+    {"name": "FOX .c", "id": "14539175875ea1ccde8ce"},
+    {"name": "FOX .s", "id": "1498459094c86300dd688c"},
+    {"name": "FOX CRIME HEVC .b", "id": "31503810386e1be804a835"},
+    {"name": "FOX TV HD (H265) .b", "id": "1345288490af706454a2b2"},
+    {"name": "FOX TV HEVC .b", "id": "2907081311ea1629502e0f"},
+    {"name": "FOX TV RAW .b", "id": "3839621464aa995fe048ce"},
+    {"name": "FOX TV SD .b", "id": "2843182981088252df1403"},
+    {"name": "FX .c", "id": "382143364970784d990878"},
+    {"name": "FX .s", "id": "28511479911822cfde0005"},
+    {"name": "GAZIANTEP GRT TV .b", "id": "28430116980561d04db9e1"},
+    {"name": "GIZEMLER DIYARI .b", "id": "137618031334f1d315d6c4"},
+    {"name": "GLOBAL BOX ACTION .b", "id": "2456232539a0f9283d418b"},
+    {"name": "GLOBAL BOX COMEDY .b", "id": "18280597356594959726c2"},
+    {"name": "GLOBAL BOX DRAM .b", "id": "1040144724c843e127b1f8"},
+    {"name": "GLOBAL BOX FANTASTIC .b", "id": "155746504623fb5cc3759d"},
+    {"name": "GLOBAL BOX KEMAL SUNAL .b", "id": "4275446197442fb43a2e5e"},
+    {"name": "GLOBAL BOX KORKU .b", "id": "562681030e6f16337d442"},
+    {"name": "GLOBAL BOX VIZYON .b", "id": "29601128085573d4f48ee8"},
+    {"name": "GLOBAL BOX YE IL AM .b", "id": "2046943434abdeefd99cc9"},
+    {"name": "GLOBAL BOX YERLI .b", "id": "23222622101ba7812517d7"},
+    {"name": "GLOBAL HABER HD .b", "id": "1224377838995614ed0843"},
+    {"name": "GONCA TV .c", "id": "2078775973ee3b3949894b"},
+    {"name": "GRT TV .c", "id": "257753427816f6887294b8"},
+    {"name": "GS TV .s", "id": "424042932536399e482d69"},
+    {"name": "GSTV HD .b", "id": "205624997b81c3ae888c2"},
+    {"name": "GUNEYDOGU .s", "id": "454047044e689f6c02bf8"},
+    {"name": "GUNEYDOGU TV .c", "id": "3302625312acf4f83dd0ca"},
+    {"name": "HABER 61 .c", "id": "292300494652c302afd5d5"},
+    {"name": "HABER GLOBAL .c", "id": "6522100826dbe8b656800"},
+    {"name": "HABER GLOBAL .s", "id": "2483036808d11f366dc42d"},
+    {"name": "HABER GLOBAL HD .b", "id": "40697740688fd0b8c6b747"},
+    {"name": "HABER GLOBAL HD+ SD .b", "id": "4144668031412a19aa2d0e"},
+    {"name": "HABER T RK HD+ SD .b", "id": "32253354543986c7294970"},
+    {"name": "HABER TURK .s", "id": "464378170623140c01606"},
+    {"name": "HABER TURK HD .b", "id": "2360854158813051c3c887"},
+    {"name": "HABER TURK HEVC .b", "id": "1857563183bcf218ac2da8"},
+    {"name": "HABERTURK .c", "id": "24027723806f7d250c32c3"},
+    {"name": "HABERTURK HD .b", "id": "1470199900779ccbec63ec"},
+    {"name": "HABERTURK RAW .b", "id": "2129890787bca734ae3a3c"},
+    {"name": "HABITAT .c", "id": "1281270568d7cb2533f147"},
+    {"name": "HALK TV .c", "id": "41485137195d9985f1f81c"},
+    {"name": "HALK TV .s", "id": "39864441068cba19bc41f2"},
+    {"name": "HALK TV HD .b", "id": "17719991006aa1a0ebf68a"},
+    {"name": "HALK TV SD .b", "id": "9403684fc992fae119e"},
+    {"name": "HAPSUU TV .b", "id": "22112092316dd6bbadb8b7"},
+    {"name": "HEIDI .b", "id": "283434169125bc54938165"},
+    {"name": "HISTORY CHANNEL .s", "id": "24153315684694fb309dba"},
+    {"name": "HISTORY HD .b", "id": "420748756258a17d4693fc"},
+    {"name": "HORROR 1 HD .b", "id": "36119753125c0620550bed"},
+    {"name": "HORROR 2 HD .b", "id": "15061057158ff2a8dd9cee"},
+    {"name": "HORROR 3 HD .b", "id": "2507102701b39115b2ed04"},
+    {"name": "HORROR 4 HD .b", "id": "26787391882b7e6269672b"},
+    {"name": "HORROR 5 HD .b", "id": "139252951413a076a7b3ed"},
+    {"name": "HRT .b", "id": "2826493312357d40edbc08"},
+    {"name": "HRT AKDENIZ .s", "id": "2119436951bd2712c4541c"},
+    {"name": "HRT AKDENIZ TV .c", "id": "4223430509a4cfa811948c"},
+    {"name": "HT SPOR HD .b", "id": "2773338492aa94862b5b31"},
+    {"name": "HUNAT TV .c", "id": "1602719314ed9049107b07"},
+    {"name": "ICEL TV .c", "id": "248885940021ca59895ab2"},
+    {"name": "IDMAN TV HD .b", "id": "2368422760ba45ce579307"},
+    {"name": "ILAHI COCUK TV .b", "id": "40159240758445efc955c"},
+    {"name": "INVESTIGATION DISCOVERY .c", "id": "1372455233dfff5072538c"},
+    {"name": "ISVI RE VIZYON TV .b", "id": "16767374902e45f8713ca0"},
+    {"name": "ITFAYECI SAM .b", "id": "9380153280c48b3769351"},
+    {"name": "IZ TV .b", "id": "3847791361fc30e8aeff33"},
+    {"name": "IZMIR TV 35 .b", "id": "666189323a5c95459735b"},
+    {"name": "JURASSIC WORLD .b", "id": "214296923688a55315e0a2"},
+    {"name": "KABE TV CANLI .b", "id": "41643465500ab17f931fac"},
+    {"name": "KADIRGA .s", "id": "2717283979bbc89b971f6e"},
+    {"name": "KADIRGA TV .c", "id": "2093940826f764b66f64f5"},
+    {"name": "KAHRAMANMARA AKSU TV .b", "id": "1716018058bd4b2efcbfe2"},
+    {"name": "KANAL 12 .c", "id": "29173714095b974b9b47bc"},
+    {"name": "KANAL 15 .c", "id": "5328942090f811960bbb5"},
+    {"name": "KANAL 15 .s", "id": "328914504230e0c25f2df0"},
+    {"name": "KANAL 23 .c", "id": "3706606233e15ade88c7a"},
+    {"name": "KANAL 24 HD .b", "id": "4179564147cef11bb1db33"},
+    {"name": "KANAL 26 .c", "id": "3740752511c05619e34353"},
+    {"name": "KANAL 26 .s", "id": "87578284c27a5347875c"},
+    {"name": "KANAL 3 .c", "id": "1558612099f5cdf062ccd3"},
+    {"name": "KANAL 3 .s", "id": "117856985466bafacf1124"},
+    {"name": "KANAL 32 .c", "id": "37609264903fe9705b8a5e"},
+    {"name": "KANAL 33 .c", "id": "3712681642ee46cb7cc87c"},
+    {"name": "KANAL 34 .c", "id": "18693393220cb8b1cc1d42"},
+    {"name": "KANAL 360 HEVC .b", "id": "335705245336ec860488ed"},
+    {"name": "KANAL 360 UHD .b", "id": "348853224424490830f4fe"},
+    {"name": "KANAL 42 KONYA .s", "id": "15182323977bde168d38f8"},
+    {"name": "KANAL 58 .c", "id": "2093143206eceaba595c07"},
+    {"name": "KANAL 58 .s", "id": "28027024539d984983ade4"},
+    {"name": "KANAL 68 .s", "id": "56371887593c852f21e1a"},
+    {"name": "KANAL 7 .c", "id": "284204601910a1d31e579f"},
+    {"name": "KANAL 7 .s", "id": "3015649982c331c4fb85f8"},
+    {"name": "KANAL 7 AVRUPA .c", "id": "916532487174bf814970d"},
+    {"name": "KANAL 7 AVRUPA .s", "id": "4986459771133ab4a2f33"},
+    {"name": "KANAL 7 EUROPA .b", "id": "326498336471980dd56f67"},
+    {"name": "KANAL 7 FHD .b", "id": "2736723250cbdbc6581c7c"},
+    {"name": "KANAL 7 HD .b", "id": "16398895980886efa9037e"},
+    {"name": "KANAL 7 HEVC .b", "id": "3897412802d4338ee87b0a"},
+    {"name": "KANAL 7 RAW .b", "id": "817959285c682bf3e522b"},
+    {"name": "KANAL AVRUPA .c", "id": "1096791444308425496108"},
+    {"name": "KANAL AVRUPA .s", "id": "4085283006575fbfb6b120"},
+    {"name": "KANAL B .c", "id": "2555658748ced1bf112baa"},
+    {"name": "KANAL B .s", "id": "219029632197a4acdec89f"},
+    {"name": "KANAL D .c", "id": "38723286086ff52dd7cac"},
+    {"name": "KANAL D .s", "id": "231583905a5fd80471ac8"},
+    {"name": "KANAL D FHD .b", "id": "1781656098069f8c014f2b"},
+    {"name": "KANAL D HD .b", "id": "113044193323e36b85a648"},
+    {"name": "KANAL D HD (H265) .b", "id": "13713062708ede849035ef"},
+    {"name": "KANAL D HEVC .b", "id": "41138222975f1bf462585f"},
+    {"name": "KANAL D RAW .b", "id": "4193250917a1b264cec859"},
+    {"name": "KANAL D SD .b", "id": "712040085633ac28facb4"},
+    {"name": "KANAL FIRAT .c", "id": "7440218437e242db07f3d"},
+    {"name": "KANAL HAYAT .c", "id": "897076110f2f104884685"},
+    {"name": "KANAL T .s", "id": "18316756832635b98c5840"},
+    {"name": "KANAL URFA .c", "id": "847659673132d7ebf20cd"},
+    {"name": "KANAL URFA .s", "id": "8138315577bf2ae8bf70e"},
+    {"name": "KANAL V .c", "id": "22154054220264091689b"},
+    {"name": "KANAL V .s", "id": "4014377632f76bd61156e"},
+    {"name": "KANAL Z .c", "id": "336832863925e92ac188c1"},
+    {"name": "KANAL Z .s", "id": "3525155138d89c21c9bc3c"},
+    {"name": "KARADENIZ BRTV .b", "id": "1846780399d742807cb82e"},
+    {"name": "KARDELEN TV .c", "id": "127011060769330a43e05e"},
+    {"name": "KARDELEN TV .s", "id": "1198414561ad7fab54a200"},
+    {"name": "KARE TV .b", "id": "3390708983dceb590f99bf"},
+    {"name": "KAY TV .c", "id": "23796466374e2ee05f0779"},
+    {"name": "KAYSERI KAY TV .b", "id": "1680483887afbf5bdf5ab"},
+    {"name": "KAYSERI KENT TV .b", "id": "161664882db20229c6558"},
+    {"name": "KAYSERI LIFE TV .b", "id": "82920494637269fca29fd"},
+    {"name": "KAYSERI OLAY T RK TV .b", "id": "2071472807593f1d194a5a"},
+    {"name": "KELOGLAN .s", "id": "7506985355cc13fb952d5"},
+    {"name": "KELOGLAN TV .b", "id": "4644476933bb028f5c20f"},
+    {"name": "KENT TÜRK .c", "id": "3962582829ee477739be5f"},
+    {"name": "KENT TURK .s", "id": "7046897870b9485f78db8"},
+    {"name": "KIBRIS GENÇ TV .c", "id": "311547741928e82131a818"},
+    {"name": "KIBRIS KANAL T .c", "id": "506213824a8ea2f79b5e0"},
+    {"name": "KIBRIS TV .c", "id": "6319306667939f9fe7402"},
+    {"name": "KINGBOX ACTION .b", "id": "3186688793d82687fd0609"},
+    {"name": "KOCAELI TV .c", "id": "3702528985a3c17ff125d1"},
+    {"name": "KON TV .c", "id": "862610701d8d72799d50e"},
+    {"name": "KON TV .s", "id": "158799585456f0116e352b"},
+    {"name": "KONUSAN TOM .b", "id": "363891195433c45cb68fe2"},
+    {"name": "KONYA KON TV .b", "id": "37593642738038d993fa1e"},
+    {"name": "KONYA OLAY TV .c", "id": "5783808618f2bafca5dba"},
+    {"name": "KOSTEBEKGILLER TV .b", "id": "277878129786cfb72a8e2e"},
+    {"name": "KÖY TV .c", "id": "870320507489feac51e9a"},
+    {"name": "KOY TV .s", "id": "685300988b10d8590b08d"},
+    {"name": "KOZA TV .c", "id": "1047804470f83375a3863a"},
+    {"name": "KRAL FM .b", "id": "358503385607b86bf71c43"},
+    {"name": "KRAL FM ARABESK .b", "id": "222080778325a1bcf07f54"},
+    {"name": "KRAL POP .s", "id": "416983899397e266de7f51"},
+    {"name": "KRAL POP HD+ .b", "id": "401243274930b2f0a2040b"},
+    {"name": "KRAL POP RADYO T RK E POP .b", "id": "3295096268eab2a5c02580"},
+    {"name": "KRAL SAKIR .s", "id": "157887264276aef2d064b9"},
+    {"name": "KRAL SAKIR TV .b", "id": "3808834024146c898b2ca8"},
+    {"name": "KRAL TV .c", "id": "1505032467d0e227960a29"},
+    {"name": "KRAL TV .s", "id": "1131281902d9a86688e843"},
+    {"name": "KRAL TV HD .b", "id": "2879812830599c43994d1e"},
+    {"name": "KRT .c", "id": "331685130407411552595"},
+    {"name": "KRT HD+ SD .b", "id": "14328530251177683d27e4"},
+    {"name": "KRT TV .s", "id": "3998379019966ad1915be2"},
+    {"name": "KRT TV HD .b", "id": "535260022435d62839cf5"},
+    {"name": "KUDUS TV .b", "id": "211438405134cf6d8a4129"},
+    {"name": "KUDÜS TV .c", "id": "3035951797e8a56cf0ef58"},
+    {"name": "KUDUS TV .s", "id": "5220502681f663a2e6cbe"},
+    {"name": "KUKILI TV .b", "id": "28052256344d5af5b5d64c"},
+    {"name": "KUKULI TV .b", "id": "2594585028d7c222e3966a"},
+    {"name": "KUKULI TV .s", "id": "3542561478baac950f1ac"},
+    {"name": "LALEGUL TV .b", "id": "223628794687658c254346"},
+    {"name": "LÂLEGÜL TV .c", "id": "108814985093ce0bbbf5d6"},
+    {"name": "LALEGUL TV .s", "id": "3483642933b7febea98a62"},
+    {"name": "LEYLEK KARDES .b", "id": "528021399004e91a38c73"},
+    {"name": "LIDER HABER .c", "id": "70369886837bb68700663"},
+    {"name": "LIFE TV .c", "id": "3572490349f5368e3d7944"},
+    {"name": "LIMON ZEYTIN .b", "id": "4190426847132e27b0c524"},
+    {"name": "LINE TV .c", "id": "1865892469c6a30088a293"},
+    {"name": "LOVE NATURE .c", "id": "259380083927b83aced3e1"},
+    {"name": "LOVE NATURE .s", "id": "25207935778311650dba38"},
+    {"name": "LOVE NATURE HD .b", "id": "3309481234d6bfa8dd5880"},
+    {"name": "LOVE NATURE HD+ .b", "id": "10782221721cd1db332b6b"},
+    {"name": "LUYS TV .c", "id": "5505157195cb579669a6c"},
+    {"name": "M TÜRK TV .c", "id": "375599442073736b876622"},
+    {"name": "MALATYA ERTV .b", "id": "40628667609eeef2c85a17"},
+    {"name": "MASA KOCAAYI .b", "id": "3836687525da0a2ef9dd66"},
+    {"name": "MASAL .s", "id": "408975653674b39bcbabbf"},
+    {"name": "MASAL TV .b", "id": "517032049b283af7f868b"},
+    {"name": "MAVI KARADENIZ .b", "id": "385468935030b3686d0215"},
+    {"name": "MAVI KARADENIZ .s", "id": "33750184684232d1aede57"},
+    {"name": "MAVI KARADENIZ TV .c", "id": "35988771778ded729aa251"},
+    {"name": "MAX .c", "id": "8162972206833140ccc15"},
+    {"name": "MAX 007 .c", "id": "2857813786727202097e05"},
+    {"name": "MAX AKSIYON .c", "id": "3207486934d626b3be1e79"},
+    {"name": "MAX AKSIYON 2 .c", "id": "37218055905af42d5ff2b"},
+    {"name": "MAX ANIMASYON 1 .c", "id": "3343751751a8a8c7e5eb70"},
+    {"name": "MAX GOLD .c", "id": "3268174995a93718bba188"},
+    {"name": "MAX PREMIER .c", "id": "858266837de2519924a62"},
+    {"name": "MAX TURK .c", "id": "12222724817c6557a8a82e"},
+    {"name": "MAX VIZYON 1 .c", "id": "3792548191c93cb5a746fc"},
+    {"name": "MAX VIZYON 2 .c", "id": "2779630479c620a8ca663e"},
+    {"name": "MAX VIZYON 3 .c", "id": "2563629631cb03dcc2d823"},
+    {"name": "MAX VIZYON 4 .c", "id": "720191023e621b43c1e7b"},
+    {"name": "MAYMUNLAR KRALI KONG .b", "id": "1536461938d9be774c0522"},
+    {"name": "MBAT FM ARABESK .b", "id": "27192936294eb850f65c6c"},
+    {"name": "MC EU .c", "id": "3849971860320774e59c07"},
+    {"name": "MED MUZIK .c", "id": "1861216008d929dc1edcfc"},
+    {"name": "MEDINE TV .c", "id": "1762330703435b89cf958b"},
+    {"name": "MEDYA HABER .c", "id": "22309682628a9ba731b044"},
+    {"name": "MELTEM .s", "id": "112712780768a23f1ccccb"},
+    {"name": "MELTEM TV .b", "id": "36288465850c4461a9fd50"},
+    {"name": "MELTEM TV .c", "id": "134482489061cbfbcb263a"},
+    {"name": "MERCAN TV .c", "id": "3132704137f87bc5cba15d"},
+    {"name": "MERSIN EL TV .b", "id": "1480015488d6661e191760"},
+    {"name": "MESAJ TV .b", "id": "1751593588ad9f10b37811"},
+    {"name": "MGC .b", "id": "2073766557830de7c84b42"},
+    {"name": "MGC TV .b", "id": "2591544773260cb2042fa3"},
+    {"name": "MILYON .s", "id": "586568093d2bdc08a3fed"},
+    {"name": "MIMOCAN TV .b", "id": "2175768896e5f35d5d7b27"},
+    {"name": "MINICA GO .b", "id": "26085199068ccbb304eaff"},
+    {"name": "MINIKA COCUK .b", "id": "303623168794bb7e9c54a7"},
+    {"name": "MINIKA COCUK .c", "id": "1127812993db2157455261"},
+    {"name": "MINIKA COCUK .s", "id": "4058432171427def71130d"},
+    {"name": "MINIKA GO .c", "id": "2831274809469fb72ac81c"},
+    {"name": "MINIKA GO .s", "id": "29377014217af8ee2c52c0"},
+    {"name": "MONTAG & FREITAG BULLI .b", "id": "2862980701594d8f54db77"},
+    {"name": "MOVIE SMART ACTION .s", "id": "123746094865495ec9eb64"},
+    {"name": "MOVIE SMART CLASSIC .s", "id": "3597292408836ecd197e13"},
+    {"name": "MOVIE SMART PLATIN 2 .s", "id": "180020415986f47cb1ef85"},
+    {"name": "MOVIE SMART TURK .s", "id": "353384054fb5f9b63f6c7"},
+    {"name": "MOVIESMART CLASSIC .c", "id": "1337239933e2da7f068f8a"},
+    {"name": "MOVIESMART TURK .c", "id": "37193975221c1d8ce1ff11"},
+    {"name": "MTV LIVE .b", "id": "41780715606f8ffc7fa3f"},
+    {"name": "MUFFETIS GADGET .b", "id": "2140655971f1ad35201549"},
+    {"name": "MUSLUM GURSES .c", "id": "116649464548e13965dce6"},
+    {"name": "NASREDDIN HOCA .b", "id": "2930757080c4b0b0917745"},
+    {"name": "NAT GEO .c", "id": "184566063009c2eced111a"},
+    {"name": "NAT GEO .s", "id": "1960546091bcaf052d3800"},
+    {"name": "NAT GEO WILD .c", "id": "332065496847e1d2ff5743"},
+    {"name": "NAT GEO WILD .s", "id": "1999823186f9934d6d684a"},
+    {"name": "NAT GEO WILD HD .b", "id": "1519237116daf8e783a22b"},
+    {"name": "NAT GEO WILD HD+ .b", "id": "124345657e7d701408114"},
+    {"name": "NATIONAL GEOGRAPHIC HD+ .b", "id": "1514492628e6d09b31660c"},
+    {"name": "NBA TV .c", "id": "424754270691df643b1f60"},
+    {"name": "NBA TV .s", "id": "2430655089292fc7cdfc68"},
+    {"name": "NBA TV FHD .b", "id": "2462143546905b09fb80ad"},
+    {"name": "NBA TV HD .b", "id": "35138675369ae6fbf4e941"},
+    {"name": "NICK JR .s", "id": "85708551c8303cc96ebd"},
+    {"name": "NICK JR HD HD .b", "id": "70716309912fd7c8b433e"},
+    {"name": "NICK JUNIOR .c", "id": "1384991998bbb9bc709eb1"},
+    {"name": "NICKELODEON .c", "id": "3029254675256aa43dc772"},
+    {"name": "NICKELODEON .s", "id": "30925623016e4c1bb5c343"},
+    {"name": "NICKELODEON HD .b", "id": "503443750d4adaa3772e8"},
+    {"name": "NILOYA HD+ .b", "id": "692811579f95ab595b603"},
+    {"name": "NILOYA TV .b", "id": "2728276611484869add9bb"},
+    {"name": "NILOYA TV .s", "id": "7574359887b7da4595e2a"},
+    {"name": "NOW .c", "id": "31051840561fc5d2fb58a5"},
+    {"name": "NOW TV FHD .b", "id": "919108696a1b98997373b"},
+    {"name": "NOW TV HD .b", "id": "161305206673e7c4b7739"},
+    {"name": "NR 1 HD .b", "id": "40212870138b09cd70432d"},
+    {"name": "NR1 .s", "id": "1104536008dc2d6d255ea4"},
+    {"name": "NR1 TURK HD .b", "id": "3548270931d42334c67c35"},
+    {"name": "NTV .c", "id": "39827872808e4f8366f192"},
+    {"name": "NTV .s", "id": "31645146969d653b3c12ef"},
+    {"name": "NTV HABER .s", "id": "123731096406a8cd66fdf9"},
+    {"name": "NTV HABER HD .b", "id": "12204176595f082e0b0497"},
+    {"name": "NTV HABER HEVC .b", "id": "17128499338be117e18642"},
+    {"name": "NTV HD .b", "id": "3194104127c78eba51ffc7"},
+    {"name": "NTV RAW .b", "id": "2862710352d0c07152cd12"},
+    {"name": "NTV SD .b", "id": "36146942472ee484dac88b"},
+    {"name": "NUMBER 1 .c", "id": "30669012188fcbf131218"},
+    {"name": "NUMBER 1 ASK .c", "id": "30987911721740d6428124"},
+    {"name": "NUMBER 1 DAMAR .c", "id": "4098520588b03ada0ce29"},
+    {"name": "NUMBER 1 DANCE .c", "id": "306270428681e04a31cef9"},
+    {"name": "NUMBER 1 TURK .c", "id": "3441764529c61d112317f"},
+    {"name": "NUMBER ONE FM YABANCI M ZIK BURDA .b", "id": "3916966300e4e588958124"},
+    {"name": "ON 4 .b", "id": "2257593699129a3958d39e"},
+    {"name": "ON 4 .c", "id": "133847174052c905356751"},
+    {"name": "ON 4 TV .s", "id": "420347514452cefbd5e034"},
+    {"name": "ON 6 .c", "id": "889661020f5c59638da26"},
+    {"name": "ORDU BUYUKSEHIR BELEDIYESI (OBB) .c", "id": "760981668a4f92b6e73db"},
+    {"name": "OSCAR COLLERDE .b", "id": "2879086761a7691b067170"},
+    {"name": "OUTDOOR .b", "id": "17362928703b87a6c8217"},
+    {"name": "PAK PIRPIR TV .b", "id": "42208430696fbda8155f99"},
+    {"name": "PAL STATION YABANCI M ZIK .b", "id": "42015485361f438f2db763"},
+    {"name": "PAMUKKALE .s", "id": "16478865713b5e4dfa0797"},
+    {"name": "PATRON BEBEK HD .b", "id": "2480284806a1aedf279a25"},
+    {"name": "PAW PETROL .b", "id": "1801427716cdcb87ac5fef"},
+    {"name": "PEPE TV .b", "id": "16242993968d7df0501c35"},
+    {"name": "PEPE TV .s", "id": "293997207381a95b1f9966"},
+    {"name": "PEPEE TV .b", "id": "2502633157e4cecb0b9c9c"},
+    {"name": "PEPPA PIG .b", "id": "26637368499dd5e608e02c"},
+    {"name": "PIJAMA MASKE .b", "id": "341391505826b3fd5edda6"},
+    {"name": "PIJAMA MASKELILER TV .b", "id": "10250618615799907394b"},
+    {"name": "PIRIL TV .b", "id": "16567203849c653dfcba8b"},
+    {"name": "PISI .s", "id": "3728165823dca073d0a662"},
+    {"name": "PISI TV .b", "id": "349052544410354f05ef9"},
+    {"name": "PISI TV (BACKUP) .b", "id": "201547123838d9856084ec"},
+    {"name": "POKEMON HD .b", "id": "11691035975409e65ccbdf"},
+    {"name": "POKEMON TV .b", "id": "7315857755d4bda0ebfec"},
+    {"name": "POWER DANCE .c", "id": "4234416466b6878ac343d7"},
+    {"name": "POWER FM YABANCI M ZIK .b", "id": "1299417291527618a1ccab"},
+    {"name": "POWER HD .b", "id": "23667904081b95cae45de4"},
+    {"name": "POWER LOVE .c", "id": "178350880905c3993617e6"},
+    {"name": "POWER T RK T RK E POP .b", "id": "2703806315a67a7c89a263"},
+    {"name": "POWER TURK .s", "id": "538668348aa4815e4285a"},
+    {"name": "POWER TURK HD .b", "id": "714196738c6888433546f"},
+    {"name": "POWER TURK TV .c", "id": "17666236897fc019f2aef"},
+    {"name": "POWER TV .c", "id": "1509063606ba7e6dcb8541"},
+    {"name": "POWERTURK AKUSTIK .c", "id": "3696281560e74fe1226862"},
+    {"name": "POWERTURK SLOW .c", "id": "3988461826ba353178d1f"},
+    {"name": "POWERTURK TAPTAZE .c", "id": "152810673925021b5bd6b2"},
+    {"name": "QAF TV .c", "id": "415347723abe796fc9518"},
+    {"name": "RADIO ROCK .b", "id": "536559220e5347db638cf"},
+    {"name": "RAFADAN TAYFA .b", "id": "28347595794ed594f88740"},
+    {"name": "REDBOX ARABESK TV .b", "id": "1149613711d37f7382b6da"},
+    {"name": "REDBOX TURKCE POP .b", "id": "2387657693a0888f6e12b2"},
+    {"name": "REDBULL TV .b", "id": "3839151666edd74f1c6236"},
+    {"name": "REHBER .s", "id": "41523547590dd3ad7182e1"},
+    {"name": "REHBER TV .b", "id": "1959665596c53ccefb734a"},
+    {"name": "REHBER TV .c", "id": "4239242367fb52ed133368"},
+    {"name": "RETRO T RK T RK E KLASIK .b", "id": "34152992586965d75e9ba0"},
+    {"name": "RUMELI TV .c", "id": "399798825472229f330730"},
+    {"name": "RUMELI TV .s", "id": "391881588210ea08f92125"},
+    {"name": "RUYA TRENI .b", "id": "28980136277243b68661a6"},
+    {"name": "S PER FM T RK E POP .b", "id": "460410710474124d4550a"},
+    {"name": "S SPORT .c", "id": "33465497225b9857743b71"},
+    {"name": "S SPORT .s", "id": "37183362955b988ce99242"},
+    {"name": "S SPORT 2 .c", "id": "1313768516926dc999c43b"},
+    {"name": "S SPORT 2 .s", "id": "1234604880d226de6d47be"},
+    {"name": "S SPORT+3 MAC SAATI .b", "id": "3269372326de5ff1a4d9d7"},
+    {"name": "S SPORT+4 MAC SAATI .b", "id": "1507829436cb5aa4fb5b34"},
+    {"name": "S SPORT+5 MAC SAATI .b", "id": "376048776421ffc14b9074"},
+    {"name": "S ZC SZC TV .b", "id": "24669057008c1d07812ce0"},
+    {"name": "S-SPORT 1 UHD .b", "id": "3531762195c7260405eaad"},
+    {"name": "S-SPORT 2 HD .b", "id": "1183409452148e7cb0f613"},
+    {"name": "S-SPORT 2 UHD .b", "id": "394365103048c3f48946a4"},
+    {"name": "S-SPORT HD .b", "id": "919993168ebbbfbeecc50"},
+    {"name": "S-SPORT PLUS FHD .b", "id": "403604621968c940720735"},
+    {"name": "S-SPORT+1 MAC SAATI .b", "id": "2559756791dcf166140367"},
+    {"name": "S-SPORT+2 MAC SAATI .b", "id": "2314183566dbbab2892d05"},
+    {"name": "S-SPORTS 1 SD .b", "id": "3202905239f7c8981cff1"},
+    {"name": "S-SPORTS 2 SD .b", "id": "26439990320f2e0b009aff"},
+    {"name": "SALON 1 .s", "id": "2217333005768ebcd45bd0"},
+    {"name": "SALON 2 .s", "id": "32805795494a101a59b81a"},
+    {"name": "SALON 3 .c", "id": "3828385424290f2ed403d4"},
+    {"name": "SALON 3 SINEMAX .s", "id": "915717266d3f2ea348618"},
+    {"name": "SARAN SPORT 1 .s", "id": "3962972352ea44b8b75128"},
+    {"name": "SARAN SPORT 2 .s", "id": "287875534435a082281e3f"},
+    {"name": "SAT 7 TURK .b", "id": "237609064654251acc3bd9"},
+    {"name": "SAT 7 TÜRK .c", "id": "42280465621064ebc15bba"},
+    {"name": "SAT 7 TURK .s", "id": "3343868905cee63de46df4"},
+    {"name": "SAT7 TURK .s", "id": "2978732943ad6c3ffd9d10"},
+    {"name": "SATRANÇ TV .c", "id": "1192565728f635dd56c60f"},
+    {"name": "SCIENCE & VICE .s", "id": "4188119721d54405415c0f"},
+    {"name": "SEF ROKKA TV .b", "id": "544666238c61b20d0e7a9"},
+    {"name": "SEKER HOCA .b", "id": "133120184802af54b3162c"},
+    {"name": "SEMERKAND .s", "id": "2341562915776a2be51890"},
+    {"name": "SEMERKAND RAW .b", "id": "372623895787d90dff9a7c"},
+    {"name": "SEMERKAND TV .c", "id": "786317112675e7c9749f1"},
+    {"name": "SEMERKAND TV HD .b", "id": "4096268883d8a4639bc323"},
+    {"name": "SHOW HD (H265) .b", "id": "3537232978db7b25368a4b"},
+    {"name": "SHOW MAX .c", "id": "1495761327668bcd5072dc"},
+    {"name": "SHOW MAX .s", "id": "21962786526c864f9c84d4"},
+    {"name": "SHOW RADYO .b", "id": "35098991442bd9c175ff50"},
+    {"name": "SHOW RADYO T RK E POP .b", "id": "12523068353d88301d1bd5"},
+    {"name": "SHOW T RK EUROPA .b", "id": "6059298215f8d058d8877"},
+    {"name": "SHOW TURK .c", "id": "20097725333f38724a70f7"},
+    {"name": "SHOW TURK .s", "id": "18802705619a03e126f4de"},
+    {"name": "SHOW TV .c", "id": "2485009235d60801ad626b"},
+    {"name": "SHOW TV .s", "id": "2395422638d4ff0c834c1d"},
+    {"name": "SHOW TV FHD .b", "id": "144949986573359afbfeae"},
+    {"name": "SHOW TV HD .b", "id": "351471337029c80ca4c64"},
+    {"name": "SHOW TV HEVC .b", "id": "37476469073149a4f729bc"},
+    {"name": "SHOW TV RAW .b", "id": "33174058547853caa0e516"},
+    {"name": "SHOW TV SD .b", "id": "211202577752738f3dc7d9"},
+    {"name": "SHOWMAX .b", "id": "1197572527f8384c637ae4"},
+    {"name": "SINEMA 1001 .s", "id": "31176836283456f45c9e32"},
+    {"name": "SINEMA 1002 .s", "id": "426904204409e59151cc23"},
+    {"name": "SINEMA AILE 1 .s", "id": "424550844375a964b5b3e5"},
+    {"name": "SINEMA AILE 2 .s", "id": "313191105166e25adfec26"},
+    {"name": "SINEMA AKSIYON 1 .s", "id": "129312789771362713c30c"},
+    {"name": "SINEMA AKSIYON 2 .s", "id": "179563017fcc76df8dfba"},
+    {"name": "SINEMA KOMEDI .s", "id": "257449668222de73cc4ad"},
+    {"name": "SINEMA TV .s", "id": "16177199419730b495b23d"},
+    {"name": "SINEMA YERLI 1 .s", "id": "24848056995333a11423de"},
+    {"name": "SINEMAX DRAMA .s", "id": "2789249461c1ad5d07b17a"},
+    {"name": "SINEMAX FAMILY .s", "id": "14694844750eea4e90973f"},
+    {"name": "SINEMAX KOMEDI .s", "id": "56581376296a68bfac79f"},
+    {"name": "SINEMAX TURK .s", "id": "4201568953301b0088849e"},
+    {"name": "SINEVIZYON 1 .s", "id": "3562169936e24369ffef8d"},
+    {"name": "SINEVIZYON 15 .s", "id": "1434492924511874701343"},
+    {"name": "SINEVIZYON 5 .s", "id": "567459984fcc0c3381a21"},
+    {"name": "SINEVIZYON 8 .s", "id": "3644982305b65576486ef2"},
+    {"name": "SINEVIZYON TURK 1 .s", "id": "237327525e72f36a04e37"},
+    {"name": "SINEVIZYON TURK 10 .s", "id": "13493455810611836e96c5"},
+    {"name": "SINEVIZYON TURK 2 .s", "id": "1233464949183c7280e3a4"},
+    {"name": "SINEVIZYON TURK 5 .s", "id": "4221956709ff9a263200e0"},
+    {"name": "SINEVIZYON TURK 6 .s", "id": "315447928559cf5bc5d2cd"},
+    {"name": "SINEVIZYON TURK 7 .s", "id": "21709212216ea5f185ca61"},
+    {"name": "SINEVIZYON TURK 8 .s", "id": "53819092d8af1f450658"},
+    {"name": "SINEVIZYON TURK 9 .s", "id": "10457659887777aa426858"},
+    {"name": "SIRINLER TV .b", "id": "38334830340b3e0ebfcab"},
+    {"name": "SIRINLER TV .s", "id": "17662417455982b1730d90"},
+    {"name": "SIRINLER TV (BACKUP) .b", "id": "1556019396cbe671ed73f4"},
+    {"name": "SIVAS .b", "id": "9857690718548a212a15f"},
+    {"name": "SL NILOYA .c", "id": "3491525845a8862ff934e0"},
+    {"name": "SLOW KARADENIZ .b", "id": "1388101311c930084973ec"},
+    {"name": "SMART COCUK .s", "id": "4277750275dc95e89a7a22"},
+    {"name": "SMART COCUK HD .b", "id": "81357489557fd83fc1e55"},
+    {"name": "SMART SPOR 1 .s", "id": "4137962062d812f45c58bd"},
+    {"name": "SON C BOOM .b", "id": "6664660641f7f8de14ebd"},
+    {"name": "SOZCU SZC TV SD .b", "id": "1098172953a40c7864dfeb"},
+    {"name": "SPIDERMAN TV .b", "id": "2478813774db6f05549bf2"},
+    {"name": "SPOR SMART .c", "id": "1771511397d05184d3e443"},
+    {"name": "SPOR SMART 2 .c", "id": "90716509593fd6426951b"},
+    {"name": "SPOR SMART 2 HD .b", "id": "2726496671ea6fd3c6dc54"},
+    {"name": "SPOR SMART FHD .b", "id": "37639315201c3521e36c44"},
+    {"name": "SPOR SMART HD .b", "id": "1313563350f4a25655e128"},
+    {"name": "SPOR SMART HEVC .b", "id": "3445708926e6195304f00c"},
+    {"name": "SPOR SMART SD .b", "id": "660246670c64f4ea57a46"},
+    {"name": "SPORTS TV .c", "id": "3422827985f7ff6e82532a"},
+    {"name": "SPORTSTV HD .b", "id": "2611296981b853ec9139b6"},
+    {"name": "STANBUL FM T RK E POP .b", "id": "24113000874a63d83f38c1"},
+    {"name": "STAR HD (H265) .b", "id": "113412438222c1fe60b23d"},
+    {"name": "STAR HD SD .b", "id": "32098928635d489700268f"},
+    {"name": "STAR TV .c", "id": "69930592375bf26f3bb25"},
+    {"name": "STAR TV .s", "id": "8634724463963caea266f"},
+    {"name": "STAR TV FHD .b", "id": "20200351284d2f7e268665"},
+    {"name": "STAR TV HD .b", "id": "272055669263af9be64671"},
+    {"name": "STAR TV HEVC .b", "id": "1386325794720c26c4132"},
+    {"name": "STAR TV RAW .b", "id": "395479001546efe8f75dd3"},
+    {"name": "SUN RTV .c", "id": "235454381152b8bdc405cf"},
+    {"name": "SUN TV .b", "id": "3122863032b740767c3962"},
+    {"name": "SÜNGER BOB .c", "id": "386858202535408958c42e"},
+    {"name": "SURELER VE T RKCE MEALI .b", "id": "3430890461cfc692e06899"},
+    {"name": "SZC .c", "id": "2036794972b992547192b9"},
+    {"name": "T RK E POP .b", "id": "27868531047ce3c7e0c624"},
+    {"name": "T.A.Y TV .b", "id": "363376564553c0e5fb6262"},
+    {"name": "TABII SPOR .c", "id": "1844863271513a413a321"},
+    {"name": "TABII SPOR 1 .c", "id": "10977951419d3dfac60f92"},
+    {"name": "TABII SPOR 1 4K .b", "id": "38306913165380d4cf64db"},
+    {"name": "TABII SPOR 1 720P .b", "id": "36659147631b81d08d6c82"},
+    {"name": "TABII SPOR 1 UHD .b", "id": "310770852202539a162e99"},
+    {"name": "TABII SPOR 2 .c", "id": "11426114102c71664711c"},
+    {"name": "TABII SPOR 2 HD .b", "id": "24901653728e4a187da4c4"},
+    {"name": "TABII SPOR 2 UHD .b", "id": "21594692318c346548c2be"},
+    {"name": "TABII SPOR 3 .c", "id": "10013463414fd5f0938a50"},
+    {"name": "TABII SPOR 3 HD .b", "id": "1489430754b4fd6e6dc327"},
+    {"name": "TABII SPOR 3 UHD .b", "id": "2546857708611b47e42ecf"},
+    {"name": "TABII SPOR 4 .c", "id": "2307885365b7f1828e97ba"},
+    {"name": "TABII SPOR 4 HD .b", "id": "13759861713a771b4b4726"},
+    {"name": "TABII SPOR 4 UHD .b", "id": "408817539739fafefc9d3b"},
+    {"name": "TABII SPOR 5 .c", "id": "3035603077ef0df0e5da67"},
+    {"name": "TABII SPOR 5 HD .b", "id": "26619334135baa08b0bc1a"},
+    {"name": "TABII SPOR 5 UHD .b", "id": "383933219867eefb660622"},
+    {"name": "TABII SPOR 6 .c", "id": "40820967253b1d74e19a7f"},
+    {"name": "TABII SPOR 6 HD .b", "id": "270984838ca5cfbf75daa"},
+    {"name": "TABII SPOR 6 UHD .b", "id": "37137089631c97c5b7ef8f"},
+    {"name": "TABII SPOR HD .b", "id": "225948008747f499d08214"},
+    {"name": "TABII SPOR SD .b", "id": "40221481750ee503c548f9"},
+    {"name": "TARIH TV .c", "id": "3856957052050da882aa10"},
+    {"name": "TARIM TV .s", "id": "19930472434be833e11c22"},
+    {"name": "TATLISES TV .c", "id": "3333865510ce3775d7abc0"},
+    {"name": "TAVSAN MOMO .b", "id": "2292336979752459c08202"},
+    {"name": "TAY .s", "id": "2927324913e16e0c2fd241"},
+    {"name": "TAY TV .c", "id": "1534287048d3b84ea2e278"},
+    {"name": "TAYO TV .b", "id": "38337041757a6e69cbe733"},
+    {"name": "TBMM TV .c", "id": "17706996443661c5809131"},
+    {"name": "TEK RUMEL TV .b", "id": "202934479567a99d31ca30"},
+    {"name": "TELE 1 .b", "id": "35602928690d57b8926e55"},
+    {"name": "TELE 1 .c", "id": "135762464349d3676ea069"},
+    {"name": "TELE 1 .s", "id": "1025979520ee1c8a3dc728"},
+    {"name": "TELE 1 SD .b", "id": "33823947399faceb7a3a0a"},
+    {"name": "TELEGRAM GRUP LINKI .b", "id": "1110088936411930c810bd"},
+    {"name": "TEMPO .s", "id": "3475377621188add6e6abc"},
+    {"name": "TEMPO TV .c", "id": "23025527440c3e840d27e8"},
+    {"name": "TEVE 2 .c", "id": "4197507696203cc2aa6667"},
+    {"name": "TEVE 2 .s", "id": "2549900211f7cf06756ad3"},
+    {"name": "TEVE 2 FHD .b", "id": "42295295583463c26f2597"},
+    {"name": "TEVE 2 HEVC .b", "id": "1333128393a9d21f4d5773"},
+    {"name": "TEVE2 RAW .b", "id": "2773252030692bf456c601"},
+    {"name": "TGRT BELGESEL .b", "id": "3925938631130980bfec69"},
+    {"name": "TGRT BELGESEL .c", "id": "2753787815ca92c106e311"},
+    {"name": "TGRT BELGESEL .s", "id": "1743993546eff3fc244a74"},
+    {"name": "TGRT EU .s", "id": "1822864752924d1506f08"},
+    {"name": "TGRT HABER .c", "id": "171842932374df57124fd0"},
+    {"name": "TGRT HABER .s", "id": "16846319590bfcc0a08157"},
+    {"name": "TGRT HABER HD .b", "id": "28143924587b833f07f3fe"},
+    {"name": "TGRT HABER HEVC .b", "id": "1355881287ef2e990a9c27"},
+    {"name": "TGRT HABER UHD .b", "id": "356274005436ab338d23af"},
+    {"name": "THAQALAYN TV .c", "id": "20593341118219d05b9042"},
+    {"name": "TIVI 6 .c", "id": "7741680162cf446ba65c6"},
+    {"name": "TIVIBU SPOR .c", "id": "1159899920595e9c441350"},
+    {"name": "TIVIBU SPOR 1 .c", "id": "25659723389efdd2098be1"},
+    {"name": "TIVIBU SPOR 1 .s", "id": "1528949791210996169a6f"},
+    {"name": "TIVIBU SPOR 2 .c", "id": "37466838109fc1c67c228d"},
+    {"name": "TIVIBU SPOR 2 .s", "id": "4782547993a1194125c51"},
+    {"name": "TIVIBU SPOR 3 .c", "id": "37949240505288959ad99c"},
+    {"name": "TIVIBU SPOR 3 .s", "id": "568442751987b14d1ad00"},
+    {"name": "TIVIBU SPOR 4 .c", "id": "1343303170fbfea75b9f15"},
+    {"name": "TIVIBU SPOR 4 HD .b", "id": "3307062704472686916fe7"},
+    {"name": "TIVIBU SPOR 5 HD .b", "id": "163038510f87c95f99d11"},
+    {"name": "TIVIBU SPOR RAW .b", "id": "1406262118fb4f653061f6"},
+    {"name": "TIVIBUSPOR 1 FHD .b", "id": "289665874444b8f4f2d451"},
+    {"name": "TIVIBUSPOR 1 HD .b", "id": "36545180071dd8a862ae2e"},
+    {"name": "TIVIBUSPOR 2 FHD .b", "id": "25026063331fd9c2bab71e"},
+    {"name": "TIVIBUSPOR 2 HD .b", "id": "1465680660b8cd069bfa4c"},
+    {"name": "TIVIBUSPOR 3 FHD .b", "id": "21863899508f19a672f26d"},
+    {"name": "TIVIBUSPOR 3 HD .b", "id": "261662401043fc1ad1ed6f"},
+    {"name": "TIVIBUSPOR SPOR HD .b", "id": "36535158588fee46401238"},
+    {"name": "TJK TV .c", "id": "3887658051a11c1211af1b"},
+    {"name": "TJK TV .s", "id": "232288806494db721ebbd5"},
+    {"name": "TJK TV HD .b", "id": "314642933454afb0ab4f31"},
+    {"name": "TLC .c", "id": "17668406603d2e9e4942ac"},
+    {"name": "TLC .s", "id": "951448076791f1a254e7c"},
+    {"name": "TLC TV .b", "id": "328164178659cf433d3442"},
+    {"name": "TMB .c", "id": "2675123009e882be009e84"},
+    {"name": "TMB .s", "id": "3465087001358304a0f232"},
+    {"name": "TOM & JERRY .b", "id": "410018565922373c7100a2"},
+    {"name": "TRABZON HABER 61 TV HD .b", "id": "1840643644b180a4d619d6"},
+    {"name": "TRANSFORMERS .b", "id": "3939293866accaed151ad9"},
+    {"name": "TROL AVCILARI .b", "id": "368305124494c3549411d4"},
+    {"name": "TRT 1 .c", "id": "2041026135d10f9c36ff66"},
+    {"name": "TRT 1 .s", "id": "1152613335bfe105ce135"},
+    {"name": "TRT 1 4K .b", "id": "30598377924b88d34eee32"},
+    {"name": "TRT 1 FHD .b", "id": "406666682989012326c7f"},
+    {"name": "TRT 1 HD .b", "id": "1221669131f90e763b2bbf"},
+    {"name": "TRT 1 HEVC .b", "id": "194373112d73ddb5898a4"},
+    {"name": "TRT 1 RAW .b", "id": "2346924541149e465206c7"},
+    {"name": "TRT 1 SD .b", "id": "566281043a6ce1d13e4fc"},
+    {"name": "TRT 2 .c", "id": "10407066957b9356f79511"},
+    {"name": "TRT 2 .s", "id": "10988270778ea74cd28244"},
+    {"name": "TRT 2 UHD .b", "id": "200530513284b4baa30873"},
+    {"name": "TRT 4K .c", "id": "3317656516b0224418b6a8"},
+    {"name": "TRT AVAZ .b", "id": "248133980972fe7049de85"},
+    {"name": "TRT AVAZ .c", "id": "691149597dd82bfd95545"},
+    {"name": "TRT AVAZ .s", "id": "407667297404ea1174243c"},
+    {"name": "TRT BELGESEL .c", "id": "59975740553631f8c458f"},
+    {"name": "TRT BELGESEL .s", "id": "2439012215c6e5b64828da"},
+    {"name": "TRT BELGESEL HD+ .b", "id": "2661394868c382749f3f0e"},
+    {"name": "TRT BELGESEL HEVC .b", "id": "33409970269ccb83ea274e"},
+    {"name": "TRT BELGESEL RAW .b", "id": "8368266978a2a0a7326d3"},
+    {"name": "TRT COCUK .c", "id": "6857948301fe52b3221a3"},
+    {"name": "TRT COCUK .s", "id": "792228122ef3135bf6801"},
+    {"name": "TRT COCUK RAW .b", "id": "3979837190d92f4a65c83b"},
+    {"name": "TRT DIYANET .s", "id": "458659205476896290c35"},
+    {"name": "TRT DIYANET COCUK .c", "id": "1101849390824792e0390b"},
+    {"name": "TRT EBA .c", "id": "3681071746569ac21b544f"},
+    {"name": "TRT EBA ILKOKUL .s", "id": "228765803362ec29207df8"},
+    {"name": "TRT EBA ORTAOKUL .s", "id": "17020398633aafc0a6bc"},
+    {"name": "TRT HABER .c", "id": "2003703357957a75b3c760"},
+    {"name": "TRT HABER .s", "id": "1890976041805b61d663e0"},
+    {"name": "TRT HABER HD .b", "id": "2579401878b96c047d58b3"},
+    {"name": "TRT HABER HEVC .b", "id": "20579655530debfaed90ec"},
+    {"name": "TRT HABER RAW .b", "id": "9310866570238353d89b"},
+    {"name": "TRT KURDI .s", "id": "175696837a5a470ee74bf"},
+    {"name": "TRT KURDI RAW .b", "id": "3640225965ac2c2232abef"},
+    {"name": "TRT MUZIK .c", "id": "23327896342ed3e26f9f31"},
+    {"name": "TRT MUZIK .s", "id": "23626784229b8f6ad5dd7a"},
+    {"name": "TRT MUZIK HD+ .b", "id": "3063329534c891d2af3f0f"},
+    {"name": "TRT MUZIK RAW .b", "id": "433581315c4ec59f78e92"},
+    {"name": "TRT OCUK HD .b", "id": "5500451029f0e83b65cf8"},
+    {"name": "TRT SPOR .c", "id": "21143354242548e3a116d2"},
+    {"name": "TRT SPOR .s", "id": "27814292671faae74c3b20"},
+    {"name": "TRT SPOR FHD .b", "id": "2952828245a3c08be2c885"},
+    {"name": "TRT SPOR HD .b", "id": "312904614dc748b02d86a"},
+    {"name": "TRT SPOR RAW .b", "id": "601788690f9e0a5148c48"},
+    {"name": "TRT SPOR YILDIZ .c", "id": "930542029ffe0c297ec0"},
+    {"name": "TRT SPOR YILDIZ .s", "id": "2081577417310aa2d344e3"},
+    {"name": "TRT SPOR YILDIZ HD .b", "id": "14238458092c57f9e072fb"},
+    {"name": "TRT SPOR YILDIZ HEVC .b", "id": "114501523d11f5030113f"},
+    {"name": "TRT SPOR YILDIZ RAW .b", "id": "268929752745bb1e55d52a"},
+    {"name": "TRT TURK .c", "id": "409809325606dced407ba1"},
+    {"name": "TRT TURK .s", "id": "79776873160ecd1f8c09f"},
+    {"name": "TRT TURK HEVC .b", "id": "1619096863c7e11f78a1b0"},
+    {"name": "TRT TURK RAW .b", "id": "4095879853e79f376bf5ca"},
+    {"name": "TRT WORLD .c", "id": "3203147403a3de72a3f660"},
+    {"name": "TRT WORLD .s", "id": "3107205535643a3fc91038"},
+    {"name": "TRT WORLD HEVC .b", "id": "39856151173297a4afd524"},
+    {"name": "TRT WORLD RAW .b", "id": "4076064178a12cbf89249a"},
+    {"name": "TRT2 RAW .b", "id": "21895121eeea9f4b76d9"},
+    {"name": "TUNCELI DERSIM 62 TV .b", "id": "9421802182c74dba9e1e6"},
+    {"name": "TURKASAT KEMAL SUNAL .c", "id": "3672931378fa31e194ae4"},
+    {"name": "TÜRKHABER TV .c", "id": "2012038243cd78e54611e8"},
+    {"name": "TURKMENLI TV .c", "id": "898098041feb3bf8f8ae0"},
+    {"name": "TV 1 .c", "id": "4073129368ac841af4a4cd"},
+    {"name": "TV 100 .b", "id": "37694889827bcff8d6501a"},
+    {"name": "TV 100 .c", "id": "16852994727259ba10c029"},
+    {"name": "TV 100 .s", "id": "1635207231a61cd1da15b"},
+    {"name": "TV 100 HEVC .b", "id": "3271096410d07fb733747f"},
+    {"name": "TV 264 .c", "id": "1984101968aa2ae3bca725"},
+    {"name": "TV 4 .c", "id": "975669992eaa57c420d25"},
+    {"name": "TV 4 .s", "id": "11932760190c77c91985e3"},
+    {"name": "TV 41 .c", "id": "210640386438fec4ca9352"},
+    {"name": "TV 41 .s", "id": "495467140d41ff7085b3"},
+    {"name": "TV 42 .c", "id": "9760498644cca0d67323e"},
+    {"name": "TV 5 .c", "id": "12213538441d78d3ba3c7"},
+    {"name": "TV 5 .s", "id": "205519968384925ef64834"},
+    {"name": "TV 52 .c", "id": "405074878169aaa15f6633"},
+    {"name": "TV 52 ORDU .s", "id": "2602281851ee63662b2b6f"},
+    {"name": "TV 8 .c", "id": "429230692196156e882cb4"},
+    {"name": "TV 8 .s", "id": "2196709234badbc159d5a2"},
+    {"name": "TV 8 HD (H265) .b", "id": "329802627004ee30bd6aa0"},
+    {"name": "TV 8 HEVC .b", "id": "1662562034e8a914e62dce"},
+    {"name": "TV 8 INT .b", "id": "1376775989e84fdc9d4aa"},
+    {"name": "TV 8 INT .s", "id": "1764745585e555f9ba3c0e"},
+    {"name": "TV 8 INTERNATIONAL .c", "id": "3546432682c60db460810f"},
+    {"name": "TV 8 SD .b", "id": "369538998733b793a5838a"},
+    {"name": "TV 8.5 .c", "id": "140923760a991ad56397"},
+    {"name": "TV 8.5 FHD .b", "id": "19082658164debc10cdc44"},
+    {"name": "TV 8.5 HD .b", "id": "3472698776e30314a5e33a"},
+    {"name": "TV 85 .s", "id": "2159436641ac7f510d0f06"},
+    {"name": "TV DEN .c", "id": "33417206402eccd63d5a50"},
+    {"name": "TV EM .s", "id": "427247780841181bd4210f"},
+    {"name": "TV KAYSERI .c", "id": "2378683302a90688067b08"},
+    {"name": "TV NET .c", "id": "1225673773af8c29391e81"},
+    {"name": "TV5 .b", "id": "935671761c36c5491c3ed"},
+    {"name": "TV8 5 RAW .b", "id": "241220593740c7258ef669"},
+    {"name": "TV8 FHD .b", "id": "3849481299fabab702b001"},
+    {"name": "TV8 HD .b", "id": "1702470161fe0c4007a0bb"},
+    {"name": "TV8 RAW .b", "id": "199101032472d01db313b0"},
+    {"name": "TV8 SD .b", "id": "208162889d5e4a2120cf8"},
+    {"name": "TVDEN TV .b", "id": "3524690612e75743431c37"},
+    {"name": "TVNET .s", "id": "122166175526c22658c312"},
+    {"name": "TVNET HD .b", "id": "11824807968f3783ce706f"},
+    {"name": "TVO TV .b", "id": "2916629658495062daeb5f"},
+    {"name": "UCANKUS .s", "id": "32155717785896dbe0ebb8"},
+    {"name": "ÜLKE TV .c", "id": "3053206623331d57002285"},
+    {"name": "ULKE TV .s", "id": "216740557e70566075e32"},
+    {"name": "ULKE TV HD .b", "id": "3641991612565b8aee4401"},
+    {"name": "ULKETV HD .b", "id": "32033343438cc3c5fe5041"},
+    {"name": "ULTRA AKSIYON .b", "id": "1910890160b94b2723e522"},
+    {"name": "ULTRA IMBD .b", "id": "15664461228f5c7a25a520"},
+    {"name": "ULTRA KEMAL SUNAL .b", "id": "317434201637fa05adb599"},
+    {"name": "ULTRA KOMEDI .b", "id": "353794604875208baceee0"},
+    {"name": "ULTRA KORKU .b", "id": "356356254709757fc813c5"},
+    {"name": "ULTRA TURK .b", "id": "1868001587a3901abe7695"},
+    {"name": "ULUSAL KANAL .b", "id": "1910048817671d14cfb4cd"},
+    {"name": "ULUSAL KANAL .c", "id": "22498016558c1c9b866616"},
+    {"name": "ULUSAL KANAL .s", "id": "8854534699ab7cd828f14"},
+    {"name": "VATAN TV .b", "id": "32821815116af88acacbb6"},
+    {"name": "VATAN TV .s", "id": "2730047464284a34ade8a0"},
+    {"name": "VIASAT EXPLORE .b", "id": "118325844000b303729ade"},
+    {"name": "VIASAT EXPLORE .c", "id": "10982410761d6faced1faa"},
+    {"name": "VIASAT EXPLORE .s", "id": "17854799144cbb1c340ac1"},
+    {"name": "VIASAT HISTORY .c", "id": "1900945213599b64fe115b"},
+    {"name": "VIASAT HISTORY .s", "id": "1515686371746ee6b20938"},
+    {"name": "VIASAT HISTORY HD+ .b", "id": "348046896213b84ce9a729"},
+    {"name": "VIASAT HISTORY HEVC .b", "id": "1165670263945583e36e19"},
+    {"name": "VIKINGLER TV .b", "id": "1253937530828d0f08d411"},
+    {"name": "VINTAGE MUSIC .c", "id": "344040122633a0c3af886a"},
+    {"name": "VIYANA TV .c", "id": "344251480556f9e5db0f41"},
+    {"name": "VIZYON 58 .c", "id": "1264201556943a2d9ea9aa"},
+    {"name": "VIZYON 58 .s", "id": "1283602496384076ba9dda"},
+    {"name": "VIZYON 58 TV SIVAS .s", "id": "2278118654dd2b5fc7cf6c"},
+    {"name": "VUSLAT TV .c", "id": "94903312294e3da09f3b7"},
+    {"name": "VUSLAT TV .s", "id": "106175275801eef0c50dd7"},
+    {"name": "WAKFU .b", "id": "54557664023a53669f0a8"},
+    {"name": "WM TV WOMAN KADIN .b", "id": "3259520726e713e4000bfa"},
+    {"name": "X NOSTALJI T RK E KLASIK .b", "id": "1767757052f44dee90b42b"},
+    {"name": "YABAN .c", "id": "3338159581a989d003ec5a"},
+    {"name": "YABAN TV .s", "id": "42046159902bf40614cf6e"},
+    {"name": "YABAN TV HD .b", "id": "178850393550c13d869fbf"},
+    {"name": "YENI KOCAELI TV .b", "id": "758663570c267cae815eb"},
+    {"name": "YESILCAM .c", "id": "15843353838096cf65cb7d"},
+    {"name": "YESILCAM 1 .s", "id": "1952835738c83bfddaf481"},
+    {"name": "YESILCAM 2 .s", "id": "8685860582340e8bd0469"},
+    {"name": "YESILCAM 3 .s", "id": "245742586a1ae349871a9"},
+    {"name": "YILDIZ EN TV .b", "id": "394501159c3596812d61e"},
+    {"name": "YILDIZ KIZ .b", "id": "12401366196105d6b0425b"},
+    {"name": "YILDIZ TV EN .c", "id": "18243160161485b6b186e7"},
+    {"name": "YOL TV .b", "id": "36035801315c2c657f7f29"},
+    {"name": "YOL TV .s", "id": "10711660543c82502a97f7"},
+    {"name": "YOL TV SD .b", "id": "607077155292bdb1bc79a"},
+    {"name": "ZONGULDAK KANAL Z .b", "id": "1467834090ec77c1def93a"},
+]
 
 @app.route('/')
 def index():
-    return "<h1>Vavoo Proxy</h1><p>Kullanim: /m3u?url=VAVOO_LINKI</p>"
+    scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{scheme}://{request.host}"
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🇹🇷 Vavoo Turkey Proxy - {len(TURKEY_CHANNELS)} Kanal</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }}
+            pre {{ background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }}
+            input {{ width: 100%; padding: 10px; margin: 10px 0; }}
+            button {{ background: #4CAF50; color: white; padding: 10px 20px; border: none; cursor: pointer; }}
+            .stats {{ background: #e3f2fd; padding: 15px; border-radius: 10px; margin: 20px 0; }}
+            .link {{ word-break: break-all; }}
+        </style>
+    </head>
+    <body>
+        <h1>🇹🇷 Vavoo Turkey Proxy</h1>
+        <p>Toplam <b>{len(TURKEY_CHANNELS)}</b> Türk kanalı</p>
+        
+        <div class="stats">
+            <h3>📊 İstatistikler:</h3>
+            <p>✅ Toplam Kanal: {len(TURKEY_CHANNELS)}</p>
+            <p>⚡ Cache: {CACHE_TIME}s</p>
+            <p>🔄 API: vavoo.to/mediahubmx-resolve.json</p>
+        </div>
+        
+        <h3>📺 M3U Playlist Linki:</h3>
+        <pre id="m3uLink">{base}/turkey.m3u</pre>
+        
+        <h3>🔍 Tek Link Test:</h3>
+        <input type="text" id="vavooUrl" placeholder="https://vavoo.to/vavoo-iptv/play/...">
+        <button onclick="testLink()">Çözümle</button>
+        <pre id="result"></pre>
+        
+        <h3>📋 Televizo'ya Ekle:</h3>
+        <p><code class="link">{base}/turkey.m3u</code></p>
+        
+        <h3>🔎 Kanal Ara:</h3>
+        <input type="text" id="search" placeholder="Kanal adı..." onkeyup="searchChannels()">
+        <div id="searchResults"></div>
+        
+        <script>
+            const channels = {json.dumps([{"name": ch["name"], "id": ch["id"]} for ch in TURKEY_CHANNELS])};
+            
+            function testLink() {{
+                let url = document.getElementById('vavooUrl').value;
+                fetch('/m3u?url=' + encodeURIComponent(url))
+                    .then(r => {{
+                        if (r.redirected) {{
+                            document.getElementById('result').innerHTML = 
+                                '✅ Yönlendiriliyor: <a href="' + r.url + '">' + r.url + '</a>';
+                        }} else {{
+                            return r.json();
+                        }}
+                    }})
+                    .then(d => {{
+                        if (d && d.streamUrl) {{
+                            document.getElementById('result').innerHTML = 
+                                '✅ Gerçek link: <a href="' + d.streamUrl + '">' + d.streamUrl + '</a>';
+                        }} else if (d && d.error) {{
+                            document.getElementById('result').innerHTML = '❌ Hata: ' + d.error;
+                        }}
+                    }});
+            }}
+            
+            function searchChannels() {{
+                let search = document.getElementById('search').value.toLowerCase();
+                if (search.length < 2) {{
+                    document.getElementById('searchResults').innerHTML = '';
+                    return;
+                }}
+                let results = channels.filter(c => c.name.toLowerCase().includes(search));
+                let html = '<h4>Bulunan Kanallar:</h4><ul>';
+                results.slice(0, 20).forEach(c => {{
+                    html += `<li>${{c.name}} - <a href="/m3u?url=https://vavoo.to/vavoo-iptv/play/${{c.id}}" target="_blank">Test Et</a></li>`;
+                }});
+                if (results.length > 20) html += '<li>... ve ' + (results.length-20) + ' kanal daha</li>';
+                html += '</ul>';
+                document.getElementById('searchResults').innerHTML = html;
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+from urllib.parse import urljoin, quote, unquote
 
 @app.route('/m3u')
 def m3u_proxy():
     url = request.args.get('url')
     if not url:
-        return "URL gerekli", 400
+        return "URL parametresi gerekli", 400
 
     app.logger.info(f"Cozuluyor: {url}")
-    real_url = resolve_url(url)
+    real_url = resolve_stream_url(url)
+    if not real_url:
+        return jsonify({"error": "stream_url_not_found", "url": url}), 502
 
-    if real_url:
-        app.logger.info(f"Gercek link: {real_url}")
-        return redirect(real_url, code=302)
-    
-    return jsonify({"error": "cozumlenemedi", "url": url}), 502
+    app.logger.info(f"Redirect: {real_url}")
+    return redirect(real_url, code=302)
 
 @app.route('/resolve')
 def resolve():
     url = request.args.get('url')
     if not url:
         return jsonify({"error": "URL gerekli"}), 400
-    real_url = resolve_url(url)
+    real_url = resolve_stream_url(url)
     if real_url:
         return jsonify({"streamUrl": real_url})
     return jsonify({"error": "cozumlenemedi"}), 502
 
 @app.route('/turkey.m3u')
 def turkey_playlist():
+    """Tüm Türkiye kanalları M3U playlist"""
+    
+    m3u_lines = ["#EXTM3U\n"]
+    m3u_lines.append(f"# TÜRKİYE KANALLARI - {len(TURKEY_CHANNELS)} KANAL\n")
+    m3u_lines.append(f"# Oluşturulma: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    # Render'da https, local'de http — otomatik algıla
     scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
     base = f"{scheme}://{request.host}"
     
-    channels = [
-        ("TRT 1 HD", "1221669131f90e763b2bbf"),
-        ("ATV HD", "1332310706d6138ade7950"),
-        ("KANAL D HD", "113044193323e36b85a648"),
-        ("SHOW TV HD", "8795889605c7795ac9528"),
-        ("STAR TV HD", "219297129315c074c03f8e"),
-        ("FOX TV HD", "15614953198c1780c4df07"),
-        ("TV8 HD", "1702470161fe0c4007a0bb"),
-        ("BEYAZ TV HD", "805689873341639546753"),
-        ("NTV HD", "2073292907cc209d200015"),
-        ("CNN TURK HD", "2056768647bd7eb3f3cf70"),
-        ("HABERTURK HD", "11966263871c480a66a299"),
-        ("A HABER HD", "535272601f07c2fbd1f2b"),
-        ("TRT HABER HD", "6036516388b222edb706e"),
-        ("A SPOR HD", "2556711030587eed1d7123"),
-        ("TRT SPOR HD", "22629699381f94fcd9dbe6"),
-        ("S SPORT HD", "21232735984a3f0b463d66"),
-        ("BEIN SPORTS 1 HD", "66217962033a2d3e9c47f"),
-        ("BEIN SPORTS 2 HD", "28515391437e928cafd5dd"),
-        ("BEIN SPORTS 3 HD", "17005958018c5d23b49ef0"),
-        ("TRT COCUK HD", "30291805064bacb8a4036d"),
-        ("CARTOON NETWORK", "327818589842dbaee1327c"),
-        ("DISNEY CHANNEL HD", "3578544716a4cc42d03dcd"),
-        ("TRT MUZIK", "970382162286220f5fa39"),
-        ("TEVE2 HD", "1917502631a9b6866e12b6"),
-        ("KANAL 7 HD", "109266795988e12fc489b6"),
-        ("TRT 2 HD", "38843190334c7e81c1c6fc"),
-        ("HALK TV", "1320391955e6c5bb1bedb6"),
-        ("24 HABER HD", "3828793616b62b9cc5834c"),
-    ]
+    for ch in TURKEY_CHANNELS:
+        m3u_lines.append(f'#EXTINF:-1 group-title="Turkey",{ch["name"]}\n')
+        proxy_url = f"{base}/m3u?url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
+        m3u_lines.append(proxy_url + "\n")
     
-    lines = ["#EXTM3U\n"]
-    for name, id in channels:
-        lines.append(f'#EXTINF:-1 group-title="Turkey",{name}\n')
-        lines.append(f'#EXTVLCOPT:http-user-agent=VAVOO/2.6\n')
-        lines.append(f'{base}/m3u?url=https://vavoo.to/vavoo-iptv/play/{id}\n')
-    
-    return Response(''.join(lines), mimetype='audio/x-mpegurl')
+    return Response(''.join(m3u_lines), mimetype='audio/x-mpegurl')
+
+
+@app.route('/vavoo_full.m3u')
+def vavoo_full():
+    """vavoo_Turkey.m3u harici dosyasını okuyup proxy'ye yönlendir"""
+    try:
+        with open('vavoo_Turkey.m3u', 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return "vavoo_Turkey.m3u dosyası bulunamadı", 404
+
+    scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+    base = f"{scheme}://{request.host}"
+
+    new_lines = ["#EXTM3U\n"]
+    for line in lines:
+        line = line.strip()
+        if line.startswith('#EXTINF'):
+            new_lines.append(line + '\n')
+        elif line.startswith('http') and 'vavoo.to' in line:
+            new_lines.append(f"{base}/m3u?url={line}\n")
+        elif line:
+            new_lines.append(line + '\n')
+
+    return Response(''.join(new_lines), mimetype='audio/x-mpegurl')
+
+@app.route('/stats')
+def stats():
+    """Cache istatistikleri"""
+    return jsonify({
+        "total_channels": len(TURKEY_CHANNELS),
+        "cache_size": len(cache),
+        "cache_time": CACHE_TIME
+    })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "timestamp": time.time()})
+    return jsonify({"status": "healthy", "timestamp": time.time()})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    print(f"🇹🇷 Vavoo Turkey Proxy Başlatılıyor...")
+    print(f"📺 Toplam Kanal: {len(TURKEY_CHANNELS)}")
+    print(f"🚀 Port: {port}")
+    print(f"📡 http://localhost:{port}/turkey.m3u")
     app.run(host='0.0.0.0', port=port, debug=False)
