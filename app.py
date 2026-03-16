@@ -1319,7 +1319,7 @@ def index():
                 results.slice(0, 20).forEach(c => {{
                     html += `<li>${{c.name}} - <a href="/m3u?url=https://vavoo.to/vavoo-iptv/play/${{c.id}}" target="_blank">Test Et</a></li>`;
                 }});
-                if (results.length > 20) html += `<li>... ve ${results.length-20} kanal daha</li>`;
+                if (results.length > 20) html += '<li>... ve ' + (results.length-20) + ' kanal daha</li>';
                 html += '</ul>';
                 document.getElementById('searchResults').innerHTML = html;
             }}
