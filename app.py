@@ -1,21 +1,131 @@
-# app.py - Render.com için Vavoo Proxy - TÜM KANALLAR
+# app.py - Render.com icin Vavoo Proxy
 from flask import Flask, request, Response, redirect, jsonify
 import requests
 import json
 import logging
 import os
-from urllib.parse import urlparse
+import re
 import time
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-VAVOO_API = "https://vavoo.to/mediahubmx-resolve.json"
+VAVOO_DOMAIN = "vavoo.to"
+VAVOO_PING_URL = "https://www.vavoo.tv/api/app/ping"
 
-# Cache için basit sözlük
+# Token cache
+_token_cache = {"token": None, "time": 0}
+TOKEN_TTL = 3600  # 1 saat
+
+# Stream URL cache
 cache = {}
 CACHE_TIME = 300  # 5 dakika
+
+
+def get_vavoo_signature():
+    now = time.time()
+    if _token_cache["token"] and (now - _token_cache["time"]) < TOKEN_TTL:
+        return _token_cache["token"]
+
+    headers = {
+        "user-agent": "okhttp/4.11.0",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "content-length": "1106",
+        "accept-encoding": "gzip"
+    }
+    data = {
+        "token": "tosFwQCJMS8qrW_AjLoHPQ41646J5dRNha6ZWHnijoYQQQoADQoXYSo7ki7O5-CsgN4CH0uRk6EEoJ0728ar9scCRQW3ZkbfrPfeCXW2VgopSW2FWDqPOoVYIuVPAOnXCZ5g",
+        "reason": "app-blur",
+        "locale": "de",
+        "theme": "dark",
+        "metadata": {
+            "device": {
+                "type": "Handset", "brand": "google", "model": "Nexus",
+                "name": "21081111RG", "uniqueId": "d10e5d99ab665233"
+            },
+            "os": {
+                "name": "android", "version": "7.1.2",
+                "abis": ["arm64-v8a", "armeabi-v7a", "armeabi"], "host": "android"
+            },
+            "app": {
+                "platform": "android", "version": "3.1.20", "buildId": "289515000",
+                "engine": "hbc85",
+                "signatures": ["6e8a975e3cbf07d5de823a760d4c2547f86c1403105020adee5de67ac510999e"],
+                "installer": "app.revanced.manager.flutter"
+            },
+            "version": {"package": "tv.vavoo.app", "binary": "3.1.20", "js": "3.1.20"}
+        },
+        "appFocusTime": 0, "playerActive": False, "playDuration": 0,
+        "devMode": False, "hasAddon": True, "castConnected": False,
+        "package": "tv.vavoo.app", "version": "3.1.20", "process": "app",
+        "firstAppStart": 1743962904623, "lastAppStart": 1743962904623,
+        "ipLocation": "", "adblockEnabled": True,
+        "proxy": {
+            "supported": ["ss", "openvpn"], "engine": "ss", "ssVersion": 1,
+            "enabled": True, "autoServer": True, "id": "pl-waw"
+        },
+        "iap": {"supported": False}
+    }
+
+    try:
+        resp = requests.post(VAVOO_PING_URL, json=data, headers=headers, timeout=15)
+        resp.raise_for_status()
+        token = resp.json().get("addonSig")
+        if token:
+            _token_cache["token"] = token
+            _token_cache["time"] = now
+            app.logger.info(f"Yeni token alindi: {token[:20]}...")
+            return token
+    except Exception as e:
+        app.logger.error(f"Token alinamadi: {e}")
+    return None
+
+
+def resolve_stream_url(vavoo_play_url):
+    if vavoo_play_url in cache:
+        cache_time, cached_url = cache[vavoo_play_url]
+        if time.time() - cache_time < CACHE_TIME:
+            return cached_url
+
+    signature = get_vavoo_signature()
+    if not signature:
+        return None
+
+    headers = {
+        "user-agent": "okhttp/4.11.0",
+        "accept": "application/json",
+        "content-type": "application/json; charset=utf-8",
+        "accept-encoding": "gzip",
+        "mediahubmx-signature": signature
+    }
+    payload = {
+        "language": "tr",
+        "region": "TR",
+        "url": vavoo_play_url,
+        "clientVersion": "3.1.20"
+    }
+
+    try:
+        resp = requests.post(
+            f"https://{VAVOO_DOMAIN}/mediahubmx-resolve.json",
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        data = resp.json()
+        real_url = None
+        if isinstance(data, list) and len(data) > 0:
+            real_url = data[0].get("url")
+        elif isinstance(data, dict):
+            real_url = data.get("url") or data.get("streamUrl")
+        if real_url:
+            cache[vavoo_play_url] = (time.time(), real_url)
+            return real_url
+    except Exception as e:
+        app.logger.error(f"Resolve hatasi: {e}")
+    return None
 
 # ===========================================
 # TÜM TÜRKİYE KANALLARI - 1000+ KANAL
@@ -1333,95 +1443,27 @@ def m3u_proxy():
     url = request.args.get('url')
     if not url:
         return "URL parametresi gerekli", 400
-    
-    app.logger.info(f"Çözülüyor: {url}")
-    
-    # Cache kontrolü
-    cache_key = url
-    if cache_key in cache:
-        cache_time, cached_url = cache[cache_key]
-        if time.time() - cache_time < CACHE_TIME:
-            app.logger.info(f"Cache'ten kullanılıyor: {cached_url}")
-            return redirect(cached_url, code=302)
-    
-    payload = {
-        "language": "tr",
-        "region": "TR",
-        "url": url,
-        "clientVersion": "3.0.3"
-    }
-    
-    headers = {
-        "User-Agent": "MediaHubMX/2",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": "https://vavoo.to",
-        "Referer": "https://vavoo.to/"
-    }
-    
-    try:
-        resp = requests.post(
-            VAVOO_API, 
-            json=payload, 
-            headers=headers,
-            timeout=15
-        )
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            
-            # Farklı yanıt formatları
-            real_url = None
-            if isinstance(data, list) and len(data) > 0:
-                if "url" in data[0]:
-                    real_url = data[0]["url"]
-            elif isinstance(data, dict):
-                real_url = data.get("streamUrl") or data.get("url")
-            
-            if real_url:
-                cache[cache_key] = (time.time(), real_url)
-                app.logger.info(f"Gerçek link: {real_url}")
-                return redirect(real_url, code=302)
-            else:
-                return jsonify({"error": "streamUrl not found", "data": data}), 404
-        else:
-            return jsonify({"error": f"API error: {resp.status_code}"}), resp.status_code
-            
-    except Exception as e:
-        app.logger.error(f"Proxy hatası: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+
+    app.logger.info(f"Cozuluyor: {url}")
+
+    real_url = resolve_stream_url(url)
+    if real_url:
+        app.logger.info(f"Gercek link: {real_url}")
+        return redirect(real_url, code=302)
+    else:
+        # Token veya resolve basarisiz — debug icin ham yaniti goster
+        sig = get_vavoo_signature()
+        return jsonify({"error": "stream_url_not_found", "token_ok": sig is not None, "url": url}), 502
 
 @app.route('/resolve')
 def resolve():
     url = request.args.get('url')
     if not url:
         return jsonify({"error": "URL gerekli"}), 400
-    
-    try:
-        payload = {
-            "language": "tr",
-            "region": "TR",
-            "url": url,
-            "clientVersion": "3.0.3"
-        }
-        
-        headers = {
-            "User-Agent": "MediaHubMX/2",
-            "Content-Type": "application/json"
-        }
-        
-        resp = requests.post(VAVOO_API, json=payload, headers=headers, timeout=15)
-        data = resp.json()
-        
-        if isinstance(data, list) and len(data) > 0:
-            return jsonify({"streamUrl": data[0].get("url")})
-        elif isinstance(data, dict):
-            return jsonify({"streamUrl": data.get("streamUrl") or data.get("url")})
-        else:
-            return jsonify({"error": "Unknown format", "data": data})
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    real_url = resolve_stream_url(url)
+    if real_url:
+        return jsonify({"streamUrl": real_url})
+    return jsonify({"error": "cozumlenemedi"}), 502
 
 @app.route('/turkey.m3u')
 def turkey_playlist():
