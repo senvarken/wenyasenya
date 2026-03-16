@@ -1457,4 +1457,4 @@ if __name__ == '__main__':
     print(f"🇹🇷 Vavoo Turkey Proxy Başlatılıyor...")
     print(f"📺 Toplam Kanal: {len(TURKEY_CHANNELS)}")
     print(f"🚀 Port: {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)  # <-- SADECE BURAYI DEĞİŞTİR
+    app.run(host='0.0.0.0', port=port)
