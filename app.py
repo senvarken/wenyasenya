@@ -23,7 +23,8 @@ cache = {}
 CACHE_TIME = 300  # 5 dakika
 
 
-def get_vavoo_signature():
+def get_lokke_signature():
+    """Lokke API ile signature al - titkenan/vavoo-iptv yontemi"""
     now = time.time()
     if _token_cache["token"] and (now - _token_cache["time"]) < TOKEN_TTL:
         return _token_cache["token"]
@@ -32,55 +33,55 @@ def get_vavoo_signature():
         "user-agent": "okhttp/4.11.0",
         "accept": "application/json",
         "content-type": "application/json; charset=utf-8",
-        "content-length": "1106",
-        "accept-encoding": "gzip"
     }
     data = {
-        "token": "tosFwQCJMS8qrW_AjLoHPQ41646J5dRNha6ZWHnijoYQQQoADQoXYSo7ki7O5-CsgN4CH0uRk6EEoJ0728ar9scCRQW3ZkbfrPfeCXW2VgopSW2FWDqPOoVYIuVPAOnXCZ5g",
-        "reason": "app-blur",
+        "token": "",
+        "reason": "boot",
         "locale": "de",
         "theme": "dark",
         "metadata": {
-            "device": {
-                "type": "Handset", "brand": "google", "model": "Nexus",
-                "name": "21081111RG", "uniqueId": "d10e5d99ab665233"
-            },
-            "os": {
-                "name": "android", "version": "7.1.2",
-                "abis": ["arm64-v8a", "armeabi-v7a", "armeabi"], "host": "android"
-            },
-            "app": {
-                "platform": "android", "version": "3.1.20", "buildId": "289515000",
-                "engine": "hbc85",
-                "signatures": ["6e8a975e3cbf07d5de823a760d4c2547f86c1403105020adee5de67ac510999e"],
-                "installer": "app.revanced.manager.flutter"
-            },
-            "version": {"package": "tv.vavoo.app", "binary": "3.1.20", "js": "3.1.20"}
+            "device": {"type": "desktop", "uniqueId": ""},
+            "os": {"name": "win32", "version": "Windows 10", "abis": ["x64"], "host": "DESKTOP-USER"},
+            "app": {"platform": "electron"},
+            "version": {"package": "app.lokke.main", "binary": "1.0.19", "js": "1.0.19"}
         },
-        "appFocusTime": 0, "playerActive": False, "playDuration": 0,
-        "devMode": False, "hasAddon": True, "castConnected": False,
-        "package": "tv.vavoo.app", "version": "3.1.20", "process": "app",
-        "firstAppStart": 1743962904623, "lastAppStart": 1743962904623,
-        "ipLocation": "", "adblockEnabled": True,
-        "proxy": {
-            "supported": ["ss", "openvpn"], "engine": "ss", "ssVersion": 1,
-            "enabled": True, "autoServer": True, "id": "pl-waw"
-        },
+        "appFocusTime": 173,
+        "playerActive": False,
+        "playDuration": 0,
+        "devMode": True,
+        "hasAddon": True,
+        "castConnected": False,
+        "package": "app.lokke.main",
+        "version": "1.0.19",
+        "process": "app",
+        "firstAppStart": int(time.time() * 1000) - 10000,
+        "lastAppStart": int(time.time() * 1000) - 10000,
+        "ipLocation": 0,
+        "adblockEnabled": True,
+        "proxy": {"supported": ["ss"], "engine": "cu", "enabled": False, "autoServer": True, "id": 0},
         "iap": {"supported": False}
     }
 
     try:
-        resp = requests.post(VAVOO_PING_URL, json=data, headers=headers, timeout=15)
+        resp = requests.post(
+            "https://www.lokke.app/api/app/ping",
+            json=data,
+            headers=headers,
+            timeout=10
+        )
         resp.raise_for_status()
         token = resp.json().get("addonSig")
         if token:
             _token_cache["token"] = token
             _token_cache["time"] = now
-            app.logger.info(f"Yeni token alindi: {token[:20]}...")
+            app.logger.info(f"Lokke token alindi: {token[:20]}...")
             return token
     except Exception as e:
-        app.logger.error(f"Token alinamadi: {e}")
+        app.logger.error(f"Lokke token alinamadi: {e}")
     return None
+
+# Alias
+get_vavoo_signature = get_lokke_signature
 
 
 def resolve_stream_url(vavoo_play_url):
@@ -94,17 +95,16 @@ def resolve_stream_url(vavoo_play_url):
         return None
 
     headers = {
-        "user-agent": "okhttp/4.11.0",
+        "user-agent": "MediaHubMX/2",
         "accept": "application/json",
         "content-type": "application/json; charset=utf-8",
-        "accept-encoding": "gzip",
         "mediahubmx-signature": signature
     }
     payload = {
-        "language": "tr",
-        "region": "TR",
+        "language": "de",
+        "region": "AT",
         "url": vavoo_play_url,
-        "clientVersion": "3.1.20"
+        "clientVersion": "3.0.2"
     }
 
     try:
