@@ -1438,6 +1438,29 @@ def index():
     </html>
     """
 
+from urllib.parse import urljoin, quote, unquote
+
+def proxy_headers():
+    return {
+        'User-Agent': 'okhttp/4.11.0',
+        'Accept': '*/*',
+    }
+
+def rewrite_m3u8(m3u8_text, base_url, proxy_base):
+    lines = m3u8_text.splitlines()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            if stripped.startswith('http'):
+                seg_url = stripped
+            else:
+                seg_url = urljoin(base_url, stripped)
+            new_lines.append(proxy_base + '/seg?url=' + quote(seg_url, safe=''))
+        else:
+            new_lines.append(line)
+    return '\n'.join(new_lines)
+
 @app.route('/m3u')
 def m3u_proxy():
     url = request.args.get('url')
@@ -1445,34 +1468,57 @@ def m3u_proxy():
         return "URL parametresi gerekli", 400
 
     app.logger.info(f"Cozuluyor: {url}")
-
     real_url = resolve_stream_url(url)
     if not real_url:
-        sig = get_vavoo_signature()
-        return jsonify({"error": "stream_url_not_found", "token_ok": sig is not None, "url": url}), 502
+        return jsonify({"error": "stream_url_not_found", "url": url}), 502
 
     app.logger.info(f"Gercek link: {real_url}")
 
-    # Once redirect dene, olmadiysa stream'i proxyle
-    mode = request.args.get('mode', 'redirect')
-    if mode == 'proxy':
-        try:
-            headers = {k: v for k, v in request.headers if k.lower() not in
-                      ['host', 'content-length', 'transfer-encoding']}
-            stream_resp = requests.get(real_url, headers=headers, stream=True, timeout=20)
-            return Response(
-                stream_resp.iter_content(chunk_size=8192),
-                status=stream_resp.status_code,
-                content_type=stream_resp.headers.get('Content-Type', 'application/vnd.apple.mpegurl'),
-                headers={
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'no-cache',
-                }
-            )
-        except Exception as e:
-            return jsonify({"error": str(e)}), 502
+    # HLS m3u8 proxy - segmentleri de proxy'den gec
+    try:
+        resp = requests.get(real_url, headers=proxy_headers(), timeout=15)
+        content_type = resp.headers.get('Content-Type', '')
+        
+        scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+        proxy_base = f"{scheme}://{request.host}"
+        
+        if 'm3u8' in content_type or 'm3u' in content_type or real_url.endswith('.m3u8'):
+            rewritten = rewrite_m3u8(resp.text, real_url, proxy_base)
+            return Response(rewritten, content_type='application/vnd.apple.mpegurl',
+                          headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'})
+        else:
+            return Response(resp.iter_content(chunk_size=8192), 
+                          content_type=content_type,
+                          headers={'Access-Control-Allow-Origin': '*'})
+    except Exception as e:
+        app.logger.error(f"HLS proxy hatasi: {e}")
+        return jsonify({"error": str(e)}), 502
 
-    return redirect(real_url, code=302)
+@app.route('/seg')
+def segment_proxy():
+    url = unquote(request.args.get('url', ''))
+    if not url:
+        return "URL gerekli", 400
+    try:
+        resp = requests.get(url, headers=proxy_headers(), stream=True, timeout=20)
+        content_type = resp.headers.get('Content-Type', 'video/mp2t')
+        
+        scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+        proxy_base = f"{scheme}://{request.host}"
+        
+        # Sub-playlist ise onu da rewrite et
+        if 'm3u8' in content_type or url.endswith('.m3u8'):
+            rewritten = rewrite_m3u8(resp.text, url, proxy_base)
+            return Response(rewritten, content_type='application/vnd.apple.mpegurl',
+                          headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'})
+        
+        # TS segment - direkt aktar
+        return Response(resp.iter_content(chunk_size=65536),
+                       content_type=content_type,
+                       headers={'Access-Control-Allow-Origin': '*'})
+    except Exception as e:
+        app.logger.error(f"Segment proxy hatasi: {e}")
+        return jsonify({"error": str(e)}), 502
 
 @app.route('/resolve')
 def resolve():
@@ -1498,7 +1544,7 @@ def turkey_playlist():
     
     for ch in TURKEY_CHANNELS:
         m3u_lines.append(f'#EXTINF:-1 group-title="Turkey",{ch["name"]}\n')
-        proxy_url = f"{base}/m3u?mode=proxy&url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
+        proxy_url = f"{base}/m3u?url=https://vavoo.to/vavoo-iptv/play/{ch['id']}"
         m3u_lines.append(proxy_url + "\n")
     
     return Response(''.join(m3u_lines), mimetype='audio/x-mpegurl')
