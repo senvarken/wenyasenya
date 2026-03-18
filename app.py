@@ -1,4 +1,4 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, redirect
 import requests
 import os
 import logging
@@ -54,23 +54,10 @@ def m3u_proxy():
         if not real_url:
             return "URL bulunamadı", 500
 
-        app.logger.info(f"Streaming URL: {real_url}")
+        app.logger.info(f"Redirecting to: {real_url}")
 
-        # Stream headers
-        stream_headers = {
-            "User-Agent": "libmpv",
-            "Accept": "*/*",
-            "Range": "bytes=0-",
-            "Icy-MetaData": "1"
-        }
-
-        # Stream proxy
-        r = requests.get(real_url, headers=stream_headers, stream=True, timeout=15)
-
-        return Response(
-            r.iter_content(chunk_size=1024),
-            content_type=r.headers.get('Content-Type', 'application/vnd.apple.mpegurl')
-        )
+        # **CRUCIAL:** Redirect player directly
+        return redirect(real_url, code=302)
 
     except Exception as e:
         app.logger.error(str(e))
