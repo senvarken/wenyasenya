@@ -62,30 +62,48 @@ def index():
 def debug():
     vid = request.args.get("v", "mgeW8Qm8-SY")
     url = f"https://www.youtube.com/watch?v={vid}"
-    cmd = ["yt-dlp", "--no-warnings", "--cookies", COOKIES, "-j", "--no-playlist", url]
+
+    results = {}
+
+    # Test 1: format yok, sadece metadata
+    cmd1 = ["yt-dlp", "--no-warnings", "--cookies", COOKIES, "-j", "--no-playlist", "--skip-download", url]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        data = None
+        r = subprocess.run(cmd1, capture_output=True, text=True, timeout=60)
         if r.stdout:
             try:
                 d = json.loads(r.stdout)
-                data = {
+                results["meta"] = {
                     "title": d.get("title"),
                     "is_live": d.get("is_live"),
-                    "url_present": bool(d.get("url") or d.get("manifest_url")),
-                    "hls": d.get("manifest_url") or d.get("url", "")[:80],
+                    "live_status": d.get("live_status"),
+                    "formats_count": len(d.get("formats", [])),
+                    "hls_manifest": d.get("manifest_url"),
+                    "format_ids": [f.get("format_id") for f in d.get("formats", [])][:10],
                 }
             except Exception:
-                data = r.stdout[:300]
-        return jsonify({
-            "returncode": r.returncode,
-            "stderr": r.stderr[:500] if r.stderr else None,
-            "data": data,
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "yt-dlp timeout (60s)"})
+                results["meta_raw"] = r.stdout[:500]
+        else:
+            results["meta_err"] = r.stderr[:300]
     except Exception as e:
-        return jsonify({"error": str(e)})
+        results["meta_exc"] = str(e)
+
+    # Test 2: sadece HLS formatı
+    cmd2 = ["yt-dlp", "--no-warnings", "--cookies", COOKIES, "-f", "91/92/93/94/95/96/best", "-j", "--no-playlist", url]
+    try:
+        r = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
+        if r.stdout:
+            try:
+                d = json.loads(r.stdout)
+                results["hls_try"] = {
+                    "url": (d.get("url") or d.get("manifest_url") or "")[:100],
+                }
+            except Exception:
+                pass
+        results["hls_err"] = r.stderr[:200] if r.stderr else None
+    except Exception as e:
+        results["hls_exc"] = str(e)
+
+    return jsonify(results)
 
 @app.route("/stream")
 def stream():
