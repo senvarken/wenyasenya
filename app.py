@@ -87,21 +87,13 @@ def debug():
     except Exception as e:
         results["meta_exc"] = str(e)
 
-    # Test 2: sadece HLS formatı
-    cmd2 = ["yt-dlp", "--no-warnings", "--cookies", COOKIES, "-f", "91/92/93/94/95/96/best", "-j", "--no-playlist", url]
+    # Test 2: mevcut formatları listele
+    cmd2 = ["yt-dlp", "--no-warnings", "--cookies", COOKIES, "--list-formats", url]
     try:
         r = subprocess.run(cmd2, capture_output=True, text=True, timeout=60)
-        if r.stdout:
-            try:
-                d = json.loads(r.stdout)
-                results["hls_try"] = {
-                    "url": (d.get("url") or d.get("manifest_url") or "")[:100],
-                }
-            except Exception:
-                pass
-        results["hls_err"] = r.stderr[:200] if r.stderr else None
+        results["formats_list"] = (r.stdout or r.stderr or "")[:1500]
     except Exception as e:
-        results["hls_exc"] = str(e)
+        results["formats_exc"] = str(e)
 
     return jsonify(results)
 
