@@ -10,4 +10,4 @@ COPY app.py .
 COPY cookies.txt .
 
 EXPOSE 10000
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:10000", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:10000", "--timeout", "120", "--keep-alive", "5", "app:app"]
