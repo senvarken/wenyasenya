@@ -6,8 +6,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# yt-dlp her zaman en güncel versiyon
+RUN pip install --no-cache-dir --upgrade yt-dlp
+
 COPY app.py .
 COPY cookies.txt .
 
 EXPOSE 10000
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:10000", "--timeout", "120", "--keep-alive", "5", "app:app"]
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:10000", "--timeout", "120", "app:app"]
